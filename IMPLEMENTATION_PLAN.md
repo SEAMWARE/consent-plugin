@@ -35,16 +35,23 @@ The consent key, the identifier search, `?receipt=true`/`recipients[0]` matching
   (`token_service_url`, `token_audience`).
 
 ### Design decisions (for review)
-1. **Mode selection.** Add `check_mode`, one of `list`, `check`, or unset. When unset,
-   **check** is used if a privacy notice id is known for the claim (from the resolver claim
-   or `privacy_notice_id`), and **list** otherwise. When `check_mode` is `check` and a claim
-   has no notice id, the response always gets a closed deny.
+1. **Mode selection.** Add `check_mode`, either `list` (the default) or `check`. List mode
+   adds `privacyNoticeId` to the query whenever a notice id is known (from the resolver claim
+   or `privacy_notice_id`), so it needs one round trip per owner and runs the same
+   `matchConsent`. Check mode needs two (`/consents/check`, then the mandatory consent read in
+   decision 2), and the spec allows only one record per subject and notice in force, so both
+   give the same decision. Check mode is therefore opt-in, as the ticket's "alternative", and
+   never picked automatically. When `check_mode` is `check` and a claim has no notice id, the
+   response always gets a closed deny.
 2. **Consumer binding stays mandatory, and both modes share one matcher.**
    - `matchConsent(req, self, ConsentResponse)` accepts a record only when `consented == true`,
      its `provider` equals this participant's own identifier (`self`), its
      `consumer` equals the requesting consumer's DID (from `consumer_claim`), its
-     `contractUri` equals the resolver's `contractUri` when that is set, and its `purposes[]`
-     contains the effective purpose when one is set. The consumer's SD URL is never compared:
+     `contractUri` equals the resolver's `contractUri` when that is set, its `privacyNoticeId`
+     equals the effective notice id when one is set, and its `purposes[]` contains the
+     effective purpose when one is set. The notice id is compared on the client too, like
+     `consented`, so the notice scoping that `require_contract` counts on does not rest only
+     on the server applying the query filter. The consumer's SD URL is never compared:
      `consumer` is always an identifier, so the SD URL is only passed to the resolver.
    - The `provider` check is needed because `/consents` and `/consents/check` also return
      consents that name this participant as the *consumer* of another provider's contract.
@@ -116,12 +123,12 @@ Files: `internal/plugin/config.go`, `internal/plugin/config_test.go`, `internal/
   search just sends no `x-visionstrust-consent-key` header.
 - Add the new fields:
   - `CheckMode string` (`check_mode`, constants `CheckModeList = "list"` and
-    `CheckModeCheck = "check"`, empty means auto)
+    `CheckModeCheck = "check"`, `applyDefaults` sets `list`)
   - `PrivacyNoticeID string` (`privacy_notice_id`)
   - `Purpose string` (`purpose`)
   - `RequireContract bool` (`require_contract`, default `false`, decision 2). Step 4 applies it.
 - Add validation:
-  - `check_mode` must be empty, `list` or `check`.
+  - `check_mode` must be `list` or `check` after defaults.
   - `privacy_notice_id`, when set, must be a UUID. Add an exported `consent.IsUUID` (stdlib
     regexp with a named pattern constant, no new dependency) so Step 3 reuses it for
     `consentId`.
@@ -206,6 +213,7 @@ Files: `internal/consent/client.go`, `internal/consent/models.go`, `internal/con
     - `provider` equals the caller's own identifier from `credentials`
     - `consumer` equals `req.Consumer`
     - `contractUri` equals `req.ContractURI` when that is set
+    - `privacyNoticeId` equals `req.PrivacyNoticeID` when that is set
     - `purposes[]` contains `req.Purpose` when that is set
   - Matching is verbatim and case-sensitive. A match returns allow with `ConsentID`.
     `req.DataResource` is not matched (it stays in the audit record only).
@@ -228,11 +236,11 @@ Files: `internal/consent/client.go`, `internal/consent/models.go`, `internal/con
 - Tests: parameterised tables for both modes, covering:
   - `matchConsent` itself: match, wrong provider (this participant is the consumer of
     another provider's consent), wrong consumer, consumer SD URL instead of DID (deny),
-    wrong contract, wrong purpose, `consented:false`, and a non-matching `data[]` that still
-    allows
+    wrong contract, wrong notice id (with and without `req.PrivacyNoticeID` set), wrong
+    purpose, `consented:false`, and a non-matching `data[]` that still allows
   - pagination with a match on page 2, and the page cap
-  - `valid:true` with a consumer match, provider mismatch, consumer mismatch or contract mismatch on the consent
-    read, `valid:false`, a missing `consentId`, a non-UUID `consentId` (no read is made),
+  - `valid:true` with a consumer match, provider mismatch, consumer mismatch, contract
+    mismatch or notice-id mismatch on the consent read, `valid:false`, a missing `consentId`, a non-UUID `consentId` (no read is made),
     a 404 on the consent read, and a check that the read sends `format=full`
   - for both modes: 401→refresh→ok, 401 twice, 403, 400, 404 on the list/check endpoint
     (rejected, not deny), 429 (plain error), 500, timeout
@@ -260,8 +268,8 @@ Files: `internal/ownerresolver/client.go` (+ test), `internal/plugin/consent.go`
     Otherwise it calls a new `metrics.RecordContractUnconstrained()`
     (`consent_contract_unconstrained_total`) and logs `logging.WarnfEvery("contract-unconstrained", ...)`.
 - Mode selection:
-  - Add a helper `modeFor(cfg, claim)` implementing decision 1, with an effective notice id
-    of claim value, else `cfg.PrivacyNoticeID`.
+  - Add a helper `effectiveNoticeID(cfg, claim)`: the claim value, else `cfg.PrivacyNoticeID`.
+    `Mode` comes from `cfg.CheckMode` alone (decision 1).
   - `check_mode=check` with no notice id means `failOutcome(failAlwaysClosed, ...)`.
 - `checkOwners` (already passing `consumerDID` since Step 3): set `Mode`, `PrivacyNoticeID`,
   `ContractURI` and the effective `Purpose` on each `ConsentRequest`.
@@ -272,7 +280,8 @@ Files: `internal/ownerresolver/client.go` (+ test), `internal/plugin/consent.go`
 - Audit: add the matched `ConsentID` to `checkedOwner` and the audit record, so a receipt can be
   fetched later by id.
 - Tests (table-driven, in `consent_test.go`):
-  - mode selection (auto→list, auto→check via config, auto→check via claim, forced list,
+  - mode selection (default→list, list with a claim or route notice id sends the
+    `privacyNoticeId` filter, a notice id alone never switches to check, forced check,
     forced check without notice id → always-closed deny)
   - config purpose fallback with `require_purpose`
   - contract scoping: unscoped claim with and without `require_contract` (deny vs. allow plus
@@ -320,6 +329,12 @@ Files: `dev/mocks/*.json`, `docker-compose.yaml`, `README.md`, `AGENTS.md`.
     shapes, and a cache key without host or consent key.
   - Add a failure-mapping table (decision 4, including other 4xx → closed and 429 → policy).
   - Document contract scoping and `require_contract` next to `require_purpose`.
+  - Recommend per-claim `contractUri` or `privacyNoticeId` from the resolver over a route-level
+    `privacy_notice_id`. A contract's notice can be superseded (`/privacy-notices/by-contract`
+    creates a new active notice), and old grants keep the old notice id. A fixed route value
+    then silently denies every new grant while old grants keep passing, so it must be updated
+    whenever the notice is superseded.
+  - State that `check_mode=list` is the default and `check` costs an extra round trip per owner.
   - Update the route example and the "How It Works" bullets.
   - Add a migration note listing the removed options (`consent_api_host`, `consent_key`,
     `CONSENT_KEY`) and stating that this is a **major** release.
