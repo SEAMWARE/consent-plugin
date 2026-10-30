@@ -13,8 +13,13 @@ The consent key, the identifier search, `?receipt=true`/`recipients[0]` matching
 - `GET /consents` takes `userIdentifier`, `privacyNoticeId`, `status` (default `GRANTED`),
   `page` and `size`, and returns `ConsentPage{content[], page, size, totalElements, totalPages}`.
   `content[]` is `ConsentResponse{id, privacyNoticeId, status, provider, consumer, purposes[]string,
-  data[]string, contractUri, ...}`. `provider` and `consumer` are participant **identifiers**
-  (DIDs), not SD URLs. The list is scoped to consents that name the caller as provider or consumer.
+  data[]string, contractUri, consented, ...}`. `provider` and `consumer` are participant
+  **identifiers** (DIDs), not SD URLs. `consented` is derived from `status` and is the field
+  the spec designates for "may data be processed under this record now". `data[]` holds the
+  personal-data **categories** copied off the notice (e.g. `"Trip records"`), not resource
+  identifiers. The list is scoped to consents that name the caller as provider or consumer.
+- Notices are per contract (`/privacy-notices/by-contract`, one active notice per contract and
+  provider), but a route-level `privacy_notice_id` is fixed and not tied to the requester.
 - `GET /consents/check?userIdentifier&privacyNoticeId(uuid, required)[&purpose]` returns
   `ConsentValidity{valid, consentId, status, purposes, reason, checkedAt}`. It is marked
   `no-store` and says nothing about the consumer. `403` means the caller is deregistered.
@@ -34,15 +39,22 @@ The consent key, the identifier search, `?receipt=true`/`recipients[0]` matching
    **check** is used if a privacy notice id is known for the claim (from the resolver claim
    or `privacy_notice_id`), and **list** otherwise. When `check_mode` is `check` and a claim
    has no notice id, the response always gets a closed deny.
-2. **Consumer binding stays mandatory.**
-   - List mode: a consent counts only if its `consumer` equals the requesting consumer
-     (the DID from `consumer_claim`, or its SD URL). Where the resolver supplies them, its
-     `contractUri`, `dataResource` (matched against `data[]`) and `purpose` (matched
-     against `purposes[]`) must also match.
-   - Check mode: `valid:true` alone doesn't say which consumer the consent names. The client
-     therefore reads `GET /consents/{consentId}` and requires its `consumer` to match. This
-     read is also the receipt lookup the ticket marks as optional. It can be dropped in
-     review if notices are guaranteed to be per-consumer.
+2. **Consumer binding stays mandatory, and both modes share one matcher.**
+   - `matchConsent(req, ConsentResponse)` accepts a record only when `consented == true`, its
+     `consumer` equals the requesting consumer's DID (from `consumer_claim`), its
+     `contractUri` equals the resolver's `contractUri` when that is set, and its `purposes[]`
+     contains the effective purpose when one is set. The consumer's SD URL is never compared:
+     `consumer` is always an identifier, so the SD URL is only passed to the resolver.
+   - `dataResource` is **not** matched against `data[]`. `data[]` holds notice categories, not
+     resource identifiers, so a verbatim match would deny every request that sets
+     `dataResource`, and check mode could not apply it anyway.
+   - List mode runs `matchConsent` on each `ConsentPage` entry.
+   - Check mode: `valid:true` alone doesn't say which consumer the consent names, and
+     `/consents/check` is only scoped to the caller being *a* party. The client therefore
+     **always** reads `GET /consents/{consentId}` and runs `matchConsent` on it. This read is
+     mandatory: without it, a route-level `privacy_notice_id` would let any consumer through
+     on another consumer's grant. It also serves as the receipt lookup the ticket marks as
+     optional.
 3. **No caching of consent answers** in either mode, so "deny after revoke" takes effect
    immediately. The token and participant-SD caches stay.
 4. **Failure mapping.**
@@ -54,8 +66,13 @@ The consent key, the identifier search, `?receipt=true`/`recipients[0]` matching
    - `5xx`, transport error or timeout: a plain error, mapped to `failByPolicy` (`fail_open`
      governs) and logged as retryable.
 5. **Purpose.** A claim's own `purpose` wins, and `purpose` in the config is the fallback.
-   `require_purpose` checks the result of that fallback.
-6. **Release.** Config fields are removed, so the work→main PR needs the **`major`**
+   `require_purpose` checks the result of that fallback. Matching is verbatim, which is also
+   how the `purpose` query parameter of `/consents/check` is applied.
+6. **To confirm with the OwnerResolver owners** (recorded in the Step 4 PR): the claim field
+   names `contractUri` and `privacyNoticeId`, and the `purpose` format. Notice purposes are
+   full sentences, while `Claim.Purpose` is currently documented as "purpose (or contract)",
+   so the resolver must emit the notice's purpose string for a purpose match to succeed.
+7. **Release.** Config fields are removed, so the work→main PR needs the **`major`**
    semver label. The release workflow then publishes the new image tag.
 
 ## Steps
@@ -122,8 +139,8 @@ Files: `internal/consent/client.go`, `internal/consent/models.go`, `internal/con
     `participantRef`, `grantedTo` with the `recipients[0]` logic, and `hasGrantedConsent`
 - `models.go`:
   - Add a `Mode` type with `ModeList` and `ModeCheck` to `ConsentRequest`.
-  - Add the fields `PrivacyNoticeID`, `ContractURI` and `ConsumerSD`. `Consumer` is now the
-    consumer's participant identifier (DID).
+  - Add the fields `PrivacyNoticeID` and `ContractURI`. `Consumer` is now the consumer's
+    participant identifier (DID). There is no `ConsumerSD` field (decision 2).
   - Add `ConsentID` to `ConsentResponse` for audit.
   - Update the package and type GoDoc so it no longer mentions Prometheus-X/Visions.
 - List mode (`listConsents`):
@@ -131,18 +148,19 @@ Files: `internal/consent/client.go`, `internal/consent/models.go`, `internal/con
     adding `&privacyNoticeId=` when it is known.
   - Page until a match is found or `totalPages` is reached, capped by `maxConsentListPages`.
     Hitting the cap without a match denies, with a reason.
-  - A record matches when:
-    - `status == "GRANTED"` (defensive, the server already defaults to it)
-    - `consumer` equals `req.Consumer` or `req.ConsumerSD`
+  - Each entry goes through `matchConsent` (decision 2):
+    - `consented == true` (defensive, the server already defaults to `status=GRANTED`)
+    - `consumer` equals `req.Consumer`
     - `contractUri` equals `req.ContractURI` when that is set
-    - `data[]` contains `req.DataResource` when that is set
     - `purposes[]` contains `req.Purpose` when that is set
   - Matching is verbatim and case-sensitive. A match returns allow with `ConsentID`.
+    `req.DataResource` is not matched (it stays in the audit record only).
 - Check mode (`checkValidity`):
   - Call `GET {base}{prefix}/consents/check?userIdentifier=&privacyNoticeId=[&purpose=]`.
   - `valid:false` denies with the server's `reason`.
-  - `valid:true` leads to `GET {base}{prefix}/consents/{consentId}`, which must name the
-    requesting consumer (decision 2). A `404` there, or a missing `consentId`, denies.
+  - `valid:true` always leads to `GET {base}{prefix}/consents/{consentId}`, and the returned
+    `ConsentResponse` must pass the same `matchConsent` as list mode (decision 2). A `404`
+    there, a failed match, or a missing `consentId` denies. This read is mandatory.
   - Never cached.
 - `CheckConsent`:
   - Keep the guards for an empty `Subject` or `Consumer`.
@@ -153,9 +171,12 @@ Files: `internal/consent/client.go`, `internal/consent/models.go`, `internal/con
   - All paths and query keys are named constants, and query strings are built with `url.Values`.
 - Update the `Client` GoDoc to describe the new flow briefly.
 - Tests: parameterised tables for both modes, covering:
-  - match, wrong consumer, wrong contract, wrong resource, wrong purpose, non-GRANTED
+  - `matchConsent` itself: match, wrong consumer, consumer SD URL instead of DID (deny),
+    wrong contract, wrong purpose, `consented:false`, and a non-matching `data[]` that still
+    allows
   - pagination with a match on page 2, and the page cap
-  - `valid:true` with a consumer match or mismatch, `valid:false`, and a 404 on the consent read
+  - `valid:true` with a consumer match, consumer mismatch or contract mismatch on the consent
+    read, `valid:false`, a missing `consentId`, and a 404 on the consent read
   - 401→refresh→ok, 401 twice, 403, 400, 500, timeout
   - a check that `Authorization: Bearer` is sent and no consent-key header is sent
 - Minimal fake updates in the plugin and integration tests so the suite stays green. The
@@ -168,7 +189,7 @@ Files: `internal/ownerresolver/client.go` (+ test), `internal/plugin/consent.go`
 `internal/plugin/consent_test.go`, `internal/audit/audit.go` (+ test) if a field is needed.
 - `ownerresolver.Claim`: add the optional `ContractURI` (`contractUri`) and `PrivacyNoticeID`
   (`privacyNoticeId`) fields to the decoded response. The request envelope is unchanged.
-  Record in the step PR that these names need confirming with the OwnerResolver owners.
+  Record in the step PR the open points from decision 6 (field names and purpose format).
 - `ownerClaim` and `distinctClaims`:
   - Carry `contractURI`, `privacyNoticeID` and the effective `purpose`
     (claim value, else `cfg.Purpose`).
@@ -178,8 +199,9 @@ Files: `internal/ownerresolver/client.go` (+ test), `internal/plugin/consent.go`
   - Add a helper `modeFor(cfg, claim)` implementing decision 1, with an effective notice id
     of claim value, else `cfg.PrivacyNoticeID`.
   - `check_mode=check` with no notice id means `failOutcome(failAlwaysClosed, ...)`.
-- `checkOwners`: build `ConsentRequest`, setting `Consumer` to `consumerDID` and `ConsumerSD`
-  to `consumerSD`. Pass `consumerDID` down from `evaluateWithResolver`.
+- `checkOwners`: build `ConsentRequest` with `Consumer` set to `consumerDID`. Pass
+  `consumerDID` down from `evaluateWithResolver`. `consumerSD` stays resolver-only
+  (`parties.consumer`).
 - Logging in `reduceOwnerResults`:
   - Auth and rejected sentinels log through `logging.ErrorfEvery("consent-auth", ... "config/auth error" ...)`.
   - Other errors log through `"consent-check"` and are marked retryable.
@@ -204,7 +226,8 @@ Files: `internal/integration/integration_test.go`.
 - Parameterise over `check_mode` ∈ {`list`, `check`}. Run the lifecycle through
   `runPluginCycle` on one fake: **deny without consent → grant → allow → revoke → deny**.
 - Keep or adapt the existing cases: custom deny response, fail-open on a 5xx, auth error
-  closed even with fail_open, a consent granted to another consumer → deny, unknown owner →
+  closed even with fail_open, a consent granted to another consumer → deny in **both** modes
+  (in check mode with a route-level `privacy_notice_id`), unknown owner →
   deny, multiple owners where one has no consent → deny.
 - Assert that no request carries `x-visionstrust-consent-key` and that no `Host` override
   is sent.
