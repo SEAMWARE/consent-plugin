@@ -40,11 +40,18 @@ The consent key, the identifier search, `?receipt=true`/`recipients[0]` matching
    or `privacy_notice_id`), and **list** otherwise. When `check_mode` is `check` and a claim
    has no notice id, the response always gets a closed deny.
 2. **Consumer binding stays mandatory, and both modes share one matcher.**
-   - `matchConsent(req, ConsentResponse)` accepts a record only when `consented == true`, its
+   - `matchConsent(req, self, ConsentResponse)` accepts a record only when `consented == true`,
+     its `provider` equals this participant's own identifier (`self`), its
      `consumer` equals the requesting consumer's DID (from `consumer_claim`), its
      `contractUri` equals the resolver's `contractUri` when that is set, and its `purposes[]`
      contains the effective purpose when one is set. The consumer's SD URL is never compared:
      `consumer` is always an identifier, so the SD URL is only passed to the resolver.
+   - The `provider` check is needed because `/consents` and `/consents/check` also return
+     consents that name this participant as the *consumer* of another provider's contract.
+     Without it, a request whose consumer claim is this participant's own DID could be
+     released on a consent that covers someone else's processing. `self` is the `identifier`
+     from `GET /participants/me`. The client always fetches it, even with a static
+     `participant_token`/`provider_sd`, so there is no configuration without the check.
    - `dataResource` is **not** matched against `data[]`. `data[]` holds notice categories, not
      resource identifiers, so a verbatim match would deny every request that sets
      `dataResource`, and check mode could not apply it anyway.
@@ -79,7 +86,8 @@ The consent key, the identifier search, `?receipt=true`/`recipients[0]` matching
 
 ### Step 1: Config surface — drop Visions-only options, add check-mode options
 Files: `internal/plugin/config.go`, `internal/plugin/config_test.go`, `internal/plugin/consent.go`
-(`clientConfigFromCfg` only), `internal/consent/client.go`, `internal/consent/client_test.go`,
+(`clientConfigFromCfg` only), `internal/plugin/consent_test.go`, `internal/consent/client.go`,
+`internal/consent/client_test.go`, `internal/integration/integration_test.go`,
 `README.md` (Configuration Reference table only).
 - Remove from `Config`:
   - `ConsentAPIHost` (`consent_api_host`)
@@ -103,6 +111,13 @@ Files: `internal/plugin/config.go`, `internal/plugin/config_test.go`, `internal/
   and keep `config_doc_test.go` green.
 - Tests: table-driven cases for each new validation rule. Remove the tests for the removed
   fields and the env fallback, and update the `cacheKey` tests.
+  - `internal/plugin/consent_test.go`: drop `ConsentKey` from the test `Config` literal.
+  - `internal/integration/integration_test.go`: drop the `consent_key` config entries and the
+    `x-visionstrust-consent-key == "itest-consent-key"` assertions. Step 5 adds the opposite
+    assertion, that the header is absent.
+  - `internal/consent/client_test.go`: drop `ConsentKey`/`Host` from every `ClientConfig`,
+    the consent-key header assertions, `TestCheckConsent_EmptyConsentKeyOmitsHeader`, and
+    the "consent key" `cacheKey` case.
 - Acceptance: `make test lint license-check` pass, and no references to `consent_api_host`,
   `consent_key` or `CONSENT_KEY` remain under `internal/`.
 
@@ -117,6 +132,12 @@ Files: `internal/consent/client.go`, `internal/consent/client_test.go`,
   - Replace `participantListEntry`, `participantsResponse` and `decodeParticipants` with the
     new shape. Keep the positive and negative caches.
 - `fetchProviderSD` and `meResponse`: decode `Participant{identifier, selfDescriptionUri}`.
+  - `credentials` also returns the caller's own `identifier` (decision 2), cached with the
+    token entry. The identifier is fetched from `/participants/me` even when `ProviderSD` or a
+    static `ParticipantToken` is configured, so the static short-circuit only skips the token
+    service, not `/me`. A configured `ProviderSD` still wins over the fetched SD URI.
+  - An empty `identifier` in the `/participants/me` response is an error (no provider binding
+    possible), mapped to `failAlwaysClosed` via `ErrConsentManagerRejected`.
 - Add the error sentinels from decision 4: `ErrConsentManagerAuth` and
   `ErrConsentManagerRejected`.
   - Map registry and `/participants/me` responses to them: 401 after refresh → auth,
@@ -124,8 +145,11 @@ Files: `internal/consent/client.go`, `internal/consent/client_test.go`,
   - In `internal/plugin/consent.go`, extend `failModeForError` so both are `failAlwaysClosed`,
     and add table cases in `consent_test.go`.
 - Tests: table-driven registry cases (found, not found, missing SD, 401→refresh, 403, 5xx,
-  malformed JSON), the `/participants/me` shape, and the `failModeForError` mapping. Update
-  `participantRegistryHandler` in the integration fakes to the new page shape.
+  malformed JSON), the `/participants/me` shape (including a missing `identifier`, and the
+  `/me` call still made with static token and `ProviderSD`), and the `failModeForError` mapping. Update
+  `participantRegistryHandler` in the integration fakes to the new page shape, and make the
+  `/v1/participants/me` fakes in `internal/plugin/consent_test.go` and the integration tests
+  return an `identifier`, since the static-config cases now call `/me` too.
 - Acceptance: the existing plugin and integration tests still pass with the new registry shape.
 
 ### Step 3: Consent client — list and check modes
@@ -150,6 +174,7 @@ Files: `internal/consent/client.go`, `internal/consent/models.go`, `internal/con
     Hitting the cap without a match denies, with a reason.
   - Each entry goes through `matchConsent` (decision 2):
     - `consented == true` (defensive, the server already defaults to `status=GRANTED`)
+    - `provider` equals the caller's own identifier from `credentials`
     - `consumer` equals `req.Consumer`
     - `contractUri` equals `req.ContractURI` when that is set
     - `purposes[]` contains `req.Purpose` when that is set
@@ -171,11 +196,12 @@ Files: `internal/consent/client.go`, `internal/consent/models.go`, `internal/con
   - All paths and query keys are named constants, and query strings are built with `url.Values`.
 - Update the `Client` GoDoc to describe the new flow briefly.
 - Tests: parameterised tables for both modes, covering:
-  - `matchConsent` itself: match, wrong consumer, consumer SD URL instead of DID (deny),
+  - `matchConsent` itself: match, wrong provider (this participant is the consumer of
+    another provider's consent), wrong consumer, consumer SD URL instead of DID (deny),
     wrong contract, wrong purpose, `consented:false`, and a non-matching `data[]` that still
     allows
   - pagination with a match on page 2, and the page cap
-  - `valid:true` with a consumer match, consumer mismatch or contract mismatch on the consent
+  - `valid:true` with a consumer match, provider mismatch, consumer mismatch or contract mismatch on the consent
     read, `valid:false`, a missing `consentId`, and a 404 on the consent read
   - 401→refresh→ok, 401 twice, 403, 400, 500, timeout
   - a check that `Authorization: Bearer` is sent and no consent-key header is sent
@@ -227,8 +253,8 @@ Files: `internal/integration/integration_test.go`.
   `runPluginCycle` on one fake: **deny without consent → grant → allow → revoke → deny**.
 - Keep or adapt the existing cases: custom deny response, fail-open on a 5xx, auth error
   closed even with fail_open, a consent granted to another consumer → deny in **both** modes
-  (in check mode with a route-level `privacy_notice_id`), unknown owner →
-  deny, multiple owners where one has no consent → deny.
+  (in check mode with a route-level `privacy_notice_id`), a consent where this participant is
+  the consumer of another provider → deny in both modes, unknown owner → deny, multiple owners where one has no consent → deny.
 - Assert that no request carries `x-visionstrust-consent-key` and that no `Host` override
   is sent.
 - Acceptance: `go test -race ./internal/integration/...` passes. This is the in-repo stand-in
