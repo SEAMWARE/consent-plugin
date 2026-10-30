@@ -55,23 +55,39 @@ The consent key, the identifier search, `?receipt=true`/`recipients[0]` matching
    - `dataResource` is **not** matched against `data[]`. `data[]` holds notice categories, not
      resource identifiers, so a verbatim match would deny every request that sets
      `dataResource`, and check mode could not apply it anyway.
+   - **Contract scoping.** The ticket asks for a match on the resolved contract, but today's
+     `ownerresolver.Claim` carries neither `contractUri` nor `privacyNoticeId`. A claim with
+     neither (and no route-level `privacy_notice_id`) would match any consent from this owner
+     to this consumer under this provider. This is treated like a missing purpose: a new
+     `require_contract` flag (default `false`, like `require_purpose`) denies such a claim, and
+     without it the check is counted (`consent_contract_unconstrained_total`) and logged with a
+     rate-limited `contract-unconstrained` warning. A route-level `privacy_notice_id` counts as
+     scoped, because a notice belongs to one contract.
    - List mode runs `matchConsent` on each `ConsentPage` entry.
    - Check mode: `valid:true` alone doesn't say which consumer the consent names, and
      `/consents/check` is only scoped to the caller being *a* party. The client therefore
      **always** reads `GET /consents/{consentId}` and runs `matchConsent` on it. This read is
      mandatory: without it, a route-level `privacy_notice_id` would let any consumer through
      on another consumer's grant. It also serves as the receipt lookup the ticket marks as
-     optional.
+     optional. The read sends `format=full`, because the receipt formats would decode as a
+     `ConsentResponse` with `consented`, `provider` and `consumer` zeroed. `consentId` comes
+     from a response body, so it must be a UUID (else deny) and is `url.PathEscape`d.
 3. **No caching of consent answers** in either mode, so "deny after revoke" takes effect
    immediately. The token and participant-SD caches stay.
 4. **Failure mapping.**
    - `200` with no match, `valid:false`, or `404` on the consent read: **deny**, and the reason
      is logged.
-   - `401` after one token refresh, `403`, or `400`: new sentinel `consent.ErrConsentManagerAuth`
-     (401/403) or `consent.ErrConsentManagerRejected` (400). Both map to `failAlwaysClosed`
-     and are logged as config/auth errors. A 403 also notes the caller may be deregistered.
-   - `5xx`, transport error or timeout: a plain error, mapped to `failByPolicy` (`fail_open`
-     governs) and logged as retryable.
+   - `401` after one token refresh, or `403`: new sentinel `consent.ErrConsentManagerAuth`.
+     A 403 also notes the caller may be deregistered.
+   - **Every other `4xx`** except `429` (e.g. `400`, a `404` on `/consents`, `/consents/check`
+     or the registry from a wrong `consent_api_prefix`, `405`, `422`): new sentinel
+     `consent.ErrConsentManagerRejected`. These are permanent misconfigurations, so
+     `fail_open` must not release data on them.
+   - Both sentinels map to `failAlwaysClosed` and are logged as config/auth errors.
+   - `429`, `5xx`, transport error or timeout: a plain error, mapped to `failByPolicy`
+     (`fail_open` governs) and logged as retryable.
+   - One shared helper (`statusError(operation, status, body)`) applies this mapping on every
+     endpoint, so the registry, `/participants/me` and both consent modes cannot diverge.
 5. **Purpose.** A claim's own `purpose` wins, and `purpose` in the config is the fallback.
    `require_purpose` checks the result of that fallback. Matching is verbatim, which is also
    how the `purpose` query parameter of `/consents/check` is applied.
@@ -79,6 +95,8 @@ The consent key, the identifier search, `?receipt=true`/`recipients[0]` matching
    names `contractUri` and `privacyNoticeId`, and the `purpose` format. Notice purposes are
    full sentences, while `Claim.Purpose` is currently documented as "purpose (or contract)",
    so the resolver must emit the notice's purpose string for a purpose match to succeed.
+   The resolver must also emit at least one of `contractUri` or `privacyNoticeId` per claim
+   (unless the route sets `privacy_notice_id`), so `require_contract` can be turned on.
 7. **Release.** Config fields are removed, so the work→main PR needs the **`major`**
    semver label. The release workflow then publishes the new image tag.
 
@@ -101,15 +119,17 @@ Files: `internal/plugin/config.go`, `internal/plugin/config_test.go`, `internal/
     `CheckModeCheck = "check"`, empty means auto)
   - `PrivacyNoticeID string` (`privacy_notice_id`)
   - `Purpose string` (`purpose`)
+  - `RequireContract bool` (`require_contract`, default `false`, decision 2). Step 4 applies it.
 - Add validation:
   - `check_mode` must be empty, `list` or `check`.
-  - `privacy_notice_id`, when set, must be a UUID. Use a stdlib check with a named pattern
-    constant, not a new dependency.
+  - `privacy_notice_id`, when set, must be a UUID. Add an exported `consent.IsUUID` (stdlib
+    regexp with a named pattern constant, no new dependency) so Step 3 reuses it for
+    `consentId`.
   - `check_mode=check` without `privacy_notice_id` is still valid, because the resolver may
     supply the notice id per claim.
-- README table: delete the `consent_api_host` and `consent_key` rows, add the three new rows,
+- README table: delete the `consent_api_host` and `consent_key` rows, add the four new rows,
   and keep `config_doc_test.go` green.
-- Tests: table-driven cases for each new validation rule. Remove the tests for the removed
+- Tests: table-driven cases for each new validation rule and for `IsUUID`. Remove the tests for the removed
   fields and the env fallback, and update the `cacheKey` tests.
   - `internal/plugin/consent_test.go`: drop `ConsentKey` from the test `Config` literal.
   - `internal/integration/integration_test.go`: drop the `consent_key` config entries and the
@@ -140,12 +160,15 @@ Files: `internal/consent/client.go`, `internal/consent/client_test.go`,
     possible), mapped to `failAlwaysClosed` via `ErrConsentManagerRejected`.
 - Add the error sentinels from decision 4: `ErrConsentManagerAuth` and
   `ErrConsentManagerRejected`.
-  - Map registry and `/participants/me` responses to them: 401 after refresh → auth,
-    403 → auth with a "caller may be deregistered" reason, 400 → rejected.
+  - Add the shared `statusError` helper from decision 4 (it wraps `unexpectedStatus`, so
+    bodies stay out of errors) and use it for registry and `/participants/me` responses:
+    401 after refresh → auth, 403 → auth with a "caller may be deregistered" reason, any
+    other 4xx except 429 → rejected, 429/5xx → plain error.
   - In `internal/plugin/consent.go`, extend `failModeForError` so both are `failAlwaysClosed`,
     and add table cases in `consent_test.go`.
-- Tests: table-driven registry cases (found, not found, missing SD, 401→refresh, 403, 5xx,
-  malformed JSON), the `/participants/me` shape (including a missing `identifier`, and the
+- Tests: a table for `statusError` (400, 401, 403, 404, 405, 422 → sentinel; 429, 500, 503 →
+  plain error), table-driven registry cases (found, not found, missing SD, 401→refresh, 403,
+  404 from a wrong prefix, 429, 5xx, malformed JSON), the `/participants/me` shape (including a missing `identifier`, and the
   `/me` call still made with static token and `ProviderSD`), and the `failModeForError` mapping. Update
   `participantRegistryHandler` in the integration fakes to the new page shape, and make the
   `/v1/participants/me` fakes in `internal/plugin/consent_test.go` and the integration tests
@@ -154,7 +177,8 @@ Files: `internal/consent/client.go`, `internal/consent/client_test.go`,
 
 ### Step 3: Consent client — list and check modes
 Files: `internal/consent/client.go`, `internal/consent/models.go`, `internal/consent/client_test.go`,
-`internal/consent/reset.go`, `internal/integration/integration_test.go` (consent-manager fake),
+`internal/consent/reset.go`, `internal/plugin/consent.go` (`checkOwners` consumer only),
+`internal/integration/integration_test.go` (consent-manager fake),
 `internal/plugin/consent_test.go` (fakes only).
 - Delete:
   - `identifierSearchPath`, `consentKeyHeader`, `resolveUserIdentifier` and the identifier cache
@@ -162,9 +186,14 @@ Files: `internal/consent/client.go`, `internal/consent/models.go`, `internal/con
   - `participantConsentsPathFmt`, `participantConsentsResponse`, `consentRecord`,
     `participantRef`, `grantedTo` with the `recipients[0]` logic, and `hasGrantedConsent`
 - `models.go`:
-  - Add a `Mode` type with `ModeList` and `ModeCheck` to `ConsentRequest`.
+  - Add a `Mode` type with `ModeList` and `ModeCheck` to `ConsentRequest`. `ModeList` is the
+    zero value, so callers that don't set `Mode` (the plugin until Step 4) get list mode.
   - Add the fields `PrivacyNoticeID` and `ContractURI`. `Consumer` is now the consumer's
     participant identifier (DID). There is no `ConsumerSD` field (decision 2).
+- `internal/plugin/consent.go`: in the same step, `checkOwners` takes `consumerDID` instead of
+  `consumerSD` and sets `Consumer: consumerDID`. `evaluateWithResolver` passes it down, and
+  `consumerSD` stays resolver-only (`parties.consumer`). This keeps the fakes honest: they
+  return DIDs as `consumer`, never SD URLs.
   - Add `ConsentID` to `ConsentResponse` for audit.
   - Update the package and type GoDoc so it no longer mentions Prometheus-X/Visions.
 - List mode (`listConsents`):
@@ -183,16 +212,17 @@ Files: `internal/consent/client.go`, `internal/consent/models.go`, `internal/con
 - Check mode (`checkValidity`):
   - Call `GET {base}{prefix}/consents/check?userIdentifier=&privacyNoticeId=[&purpose=]`.
   - `valid:false` denies with the server's `reason`.
-  - `valid:true` always leads to `GET {base}{prefix}/consents/{consentId}`, and the returned
-    `ConsentResponse` must pass the same `matchConsent` as list mode (decision 2). A `404`
-    there, a failed match, or a missing `consentId` denies. This read is mandatory.
+  - `valid:true` always leads to `GET {base}{prefix}/consents/{consentId}?format=full`, and the
+    returned `ConsentResponse` must pass the same `matchConsent` as list mode (decision 2).
+    A `404` there, a failed match, or a missing or non-UUID `consentId` (`consent.IsUUID`)
+    denies. The id is `url.PathEscape`d. This read is mandatory.
   - Never cached.
 - `CheckConsent`:
   - Keep the guards for an empty `Subject` or `Consumer`.
   - In `ModeCheck`, an empty `PrivacyNoticeID` denies.
   - Keep the single token refresh and retry on 401.
-  - Map statuses as in decision 4, using `unexpectedStatus` for 5xx so response bodies stay
-    out of errors.
+  - Map statuses through `statusError` (decision 4). The only exception is the `404` on the
+    consent read, which denies.
   - All paths and query keys are named constants, and query strings are built with `url.Values`.
 - Update the `Client` GoDoc to describe the new flow briefly.
 - Tests: parameterised tables for both modes, covering:
@@ -202,17 +232,21 @@ Files: `internal/consent/client.go`, `internal/consent/models.go`, `internal/con
     allows
   - pagination with a match on page 2, and the page cap
   - `valid:true` with a consumer match, provider mismatch, consumer mismatch or contract mismatch on the consent
-    read, `valid:false`, a missing `consentId`, and a 404 on the consent read
-  - 401→refresh→ok, 401 twice, 403, 400, 500, timeout
+    read, `valid:false`, a missing `consentId`, a non-UUID `consentId` (no read is made),
+    a 404 on the consent read, and a check that the read sends `format=full`
+  - for both modes: 401→refresh→ok, 401 twice, 403, 400, 404 on the list/check endpoint
+    (rejected, not deny), 429 (plain error), 500, timeout
   - a check that `Authorization: Bearer` is sent and no consent-key header is sent
-- Minimal fake updates in the plugin and integration tests so the suite stays green. The
-  lifecycle scenarios come in Step 5.
+- Minimal fake updates in the plugin and integration tests so the suite stays green. The fakes
+  serve list mode (the zero `Mode`) and name the consumer by DID. The lifecycle scenarios come
+  in Step 5.
 - Acceptance: `make test lint` pass, and nothing under `internal/` references
   `identifier/search`, `consents/participants`, `x-visionstrust` or `recipients`.
 
 ### Step 4: Wire the modes into the response phase
 Files: `internal/ownerresolver/client.go` (+ test), `internal/plugin/consent.go`,
-`internal/plugin/consent_test.go`, `internal/audit/audit.go` (+ test) if a field is needed.
+`internal/plugin/consent_test.go`, `internal/metrics/metrics.go` (+ test),
+`internal/audit/audit.go` (+ test) if a field is needed.
 - `ownerresolver.Claim`: add the optional `ContractURI` (`contractUri`) and `PrivacyNoticeID`
   (`privacyNoticeId`) fields to the decoded response. The request envelope is unchanged.
   Record in the step PR the open points from decision 6 (field names and purpose format).
@@ -221,13 +255,16 @@ Files: `internal/ownerresolver/client.go` (+ test), `internal/plugin/consent.go`
     (claim value, else `cfg.Purpose`).
   - Dedupe on owner + dataResource + contract + notice.
   - Run `checkPurposeScoping` on the effective purpose.
+  - Add `checkContractScoping` next to it (decision 2). A claim with no `contractUri` and no
+    effective notice id denies with `failAlwaysClosed` when `require_contract` is set.
+    Otherwise it calls a new `metrics.RecordContractUnconstrained()`
+    (`consent_contract_unconstrained_total`) and logs `logging.WarnfEvery("contract-unconstrained", ...)`.
 - Mode selection:
   - Add a helper `modeFor(cfg, claim)` implementing decision 1, with an effective notice id
     of claim value, else `cfg.PrivacyNoticeID`.
   - `check_mode=check` with no notice id means `failOutcome(failAlwaysClosed, ...)`.
-- `checkOwners`: build `ConsentRequest` with `Consumer` set to `consumerDID`. Pass
-  `consumerDID` down from `evaluateWithResolver`. `consumerSD` stays resolver-only
-  (`parties.consumer`).
+- `checkOwners` (already passing `consumerDID` since Step 3): set `Mode`, `PrivacyNoticeID`,
+  `ContractURI` and the effective `Purpose` on each `ConsentRequest`.
 - Logging in `reduceOwnerResults`:
   - Auth and rejected sentinels log through `logging.ErrorfEvery("consent-auth", ... "config/auth error" ...)`.
   - Other errors log through `"consent-check"` and are marked retryable.
@@ -238,9 +275,12 @@ Files: `internal/ownerresolver/client.go` (+ test), `internal/plugin/consent.go`
   - mode selection (auto→list, auto→check via config, auto→check via claim, forced list,
     forced check without notice id → always-closed deny)
   - config purpose fallback with `require_purpose`
+  - contract scoping: unscoped claim with and without `require_contract` (deny vs. allow plus
+    metric), scoped by claim `contractUri`, by claim notice id, and by route `privacy_notice_id`;
+    `require_contract` still denies with `fail_open:true`
   - the failure mapping end to end through `ResponseFilter`: no match → 403; `valid:false` →
-    403; 401/403 → 403 even with `fail_open:true`; 5xx/timeout → 403, or passthrough with
-    `fail_open:true`
+    403; 401/403/400/404-on-list → 403 even with `fail_open:true`; 429/5xx/timeout → 403, or
+    passthrough with `fail_open:true`
 - Acceptance: `make test-cover` passes, including the coverage floor.
 
 ### Step 5: Integration tests for the DSC consent IT scenario
@@ -278,7 +318,8 @@ Files: `dev/mocks/*.json`, `docker-compose.yaml`, `README.md`, `AGENTS.md`.
   - Rewrite "Participant authentication": the token needs the `PARTICIPANT` role and the
     participant-identifier claim, the `/participants/me` and `/participants?identifier=`
     shapes, and a cache key without host or consent key.
-  - Add a failure-mapping table.
+  - Add a failure-mapping table (decision 4, including other 4xx → closed and 429 → policy).
+  - Document contract scoping and `require_contract` next to `require_purpose`.
   - Update the route example and the "How It Works" bullets.
   - Add a migration note listing the removed options (`consent_api_host`, `consent_key`,
     `CONSENT_KEY`) and stating that this is a **major** release.
@@ -286,5 +327,12 @@ Files: `dev/mocks/*.json`, `docker-compose.yaml`, `README.md`, `AGENTS.md`.
 - Acceptance: `make test lint license-check` pass, `docker compose config` validates, and
   nothing in the repo still mentions Visions-only concepts except the migration note. The
   work→main PR must carry the `major` label so the release workflow publishes the new image
-  tag. Updating `k3s/consent-provider.yaml` in the DSC deployment to the new tag is a
-  follow-up outside this repo.
+  tag.
+
+## Ticket closure (not an agent step)
+The ticket's acceptance criterion is that the external DSC consent IT passes with the new
+image tag. That run lives outside this repo, so no step above can satisfy it, and Step 5 is
+only the in-repo stand-in. After the work→main PR is merged and the `major` release is
+published, a maintainer bumps `k3s/consent-provider.yaml` in the DSC deployment to the new
+tag and runs the DSC consent IT. Ticket #112 stays open until that run passes. A failure
+there is filed as a fix on this ticket.
