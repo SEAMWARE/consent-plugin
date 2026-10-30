@@ -26,7 +26,8 @@ The consent key, the identifier search, `?receipt=true`/`recipients[0]` matching
 - `GET /consents/{id}` (format `full`|`receipt`|`receipt-kantara`) answers `404` when the caller is
   not a party to that consent.
 - Participant registry: `GET /participants?identifier=<did>` returns
-  `ParticipantPage{content[Participant{identifier, selfDescriptionUri, ...}]}`.
+  `ParticipantPage{content[Participant{identifier, selfDescriptionUri, deregisteredAt, ...}]}`,
+  including deregistered participants.
   `GET /participants/me` returns a `Participant`. The field is now `selfDescriptionUri`
   (it was `selfDescriptionURL`), so the DID→SD mapping the resolver's `parties` rely on is
   **kept and adapted**, not deleted.
@@ -75,10 +76,13 @@ The consent key, the identifier search, `?receipt=true`/`recipients[0]` matching
      `/consents/check` is only scoped to the caller being *a* party. The client therefore
      **always** reads `GET /consents/{consentId}` and runs `matchConsent` on it. This read is
      mandatory: without it, a route-level `privacy_notice_id` would let any consumer through
-     on another consumer's grant. It also serves as the receipt lookup the ticket marks as
-     optional. The read sends `format=full`, because the receipt formats would decode as a
+     on another consumer's grant. The read sends `format=full`, because the receipt formats would decode as a
      `ConsentResponse` with `consented`, `provider` and `consumer` zeroed. `consentId` comes
      from a response body, so it must be a UUID (else deny) and is `url.PathEscape`d.
+   - **Receipts are out of scope.** The `format=full` read returns a `ConsentResponse`, not a
+     signed receipt (`receipt`/`receipt-kantara` return `{receipt, jws}`), and list mode makes
+     no read at all. The ticket's optional receipt fetch is not implemented. Instead the audit
+     record carries `consentId` (Step 4), so a receipt can be fetched by id later.
 3. **No caching of consent answers** in either mode, so "deny after revoke" takes effect
    immediately. The token and participant-SD caches stay.
 4. **Failure mapping.**
@@ -155,7 +159,12 @@ Files: `internal/consent/client.go`, `internal/consent/client_test.go`,
   - Call `GET {base}{prefix}/participants?identifier=<url-escaped DID>` and decode
     `ParticipantPage.content[]`.
   - Take the first entry whose `identifier` equals the DID and use its `selfDescriptionUri`.
-  - Empty content, or a matching entry with no SD URI, returns `ErrParticipantNotRegistered`.
+  - Empty content, a matching entry with no SD URI, or a matching entry with `deregisteredAt`
+    set returns `ErrParticipantNotRegistered` (always closed). The `identifier` filter returns
+    participants "deregistered or not", and a retained record keeps its `selfDescriptionUri`,
+    so without this check a departed consumer would reach the resolver and the consent check.
+    The deny gets an explicit, logged reason and does not rest on the server refusing to
+    deregister a participant with a GRANTED consent. Negative-cache it like "not found".
   - Replace `participantListEntry`, `participantsResponse` and `decodeParticipants` with the
     new shape. Keep the positive and negative caches.
 - `fetchProviderSD` and `meResponse`: decode `Participant{identifier, selfDescriptionUri}`.
@@ -175,7 +184,7 @@ Files: `internal/consent/client.go`, `internal/consent/client_test.go`,
     and add table cases in `consent_test.go`.
 - Tests: a table for `statusError` (400, 401, 403, 404, 405, 422 → sentinel; 429, 500, 503 →
   plain error), table-driven registry cases (found, not found, missing SD, 401→refresh, 403,
-  404 from a wrong prefix, 429, 5xx, malformed JSON), the `/participants/me` shape (including a missing `identifier`, and the
+  404 from a wrong prefix, 429, 5xx, malformed JSON, `deregisteredAt` set → not registered), the `/participants/me` shape (including a missing `identifier`, and the
   `/me` call still made with static token and `ProviderSD`), and the `failModeForError` mapping. Update
   `participantRegistryHandler` in the integration fakes to the new page shape, and make the
   `/v1/participants/me` fakes in `internal/plugin/consent_test.go` and the integration tests
@@ -261,7 +270,11 @@ Files: `internal/ownerresolver/client.go` (+ test), `internal/plugin/consent.go`
 - `ownerClaim` and `distinctClaims`:
   - Carry `contractURI`, `privacyNoticeID` and the effective `purpose`
     (claim value, else `cfg.Purpose`).
-  - Dedupe on owner + dataResource + contract + notice.
+  - Dedupe on owner + dataResource + contract + notice + effective purpose (after the
+    `cfg.Purpose` fallback). Today's `pair{owner, resource}` key drops the purpose, so claims
+    that differ only in purpose collapse into the first one. With purpose now a match
+    criterion, that would release a response under deny_all when purpose A has a grant and
+    purpose B does not.
   - Run `checkPurposeScoping` on the effective purpose.
   - Add `checkContractScoping` next to it (decision 2). A claim with no `contractUri` and no
     effective notice id denies with `failAlwaysClosed` when `require_contract` is set.
@@ -278,12 +291,15 @@ Files: `internal/ownerresolver/client.go` (+ test), `internal/plugin/consent.go`
   - Other errors log through `"consent-check"` and are marked retryable.
   - Per-owner denies log the sanitised reason at warn level, rate-limited.
 - Audit: add the matched `ConsentID` to `checkedOwner` and the audit record, so a receipt can be
-  fetched later by id.
+  fetched later by id. No receipt is fetched here (decision 2).
 - Tests (table-driven, in `consent_test.go`):
   - mode selection (default→list, list with a claim or route notice id sends the
     `privacyNoticeId` filter, a notice id alone never switches to check, forced check,
     forced check without notice id → always-closed deny)
   - config purpose fallback with `require_purpose`
+  - `distinctClaims`: same owner and resource with different purposes → two checks, and a
+    grant for only one of them → 403 under deny_all; a claim with no purpose and one whose
+    purpose equals `cfg.Purpose` → one check
   - contract scoping: unscoped claim with and without `require_contract` (deny vs. allow plus
     metric), scoped by claim `contractUri`, by claim notice id, and by route `privacy_notice_id`;
     `require_contract` still denies with `fail_open:true`
