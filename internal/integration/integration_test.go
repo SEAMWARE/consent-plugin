@@ -206,7 +206,7 @@ func newConsentManager(t *testing.T, wantSubject, userID string, statuses []stri
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"consents": consentsGrantedTo(statuses)})
 	})
 
-	mux.HandleFunc("/v1/participants", participantRegistryHandler)
+	registerParticipantEndpoints(mux)
 
 	return httptest.NewServer(mux)
 }
@@ -233,14 +233,31 @@ func consentsGrantedTo(statuses []string) []map[string]interface{} {
 	return consents
 }
 
-// participantRegistryHandler serves the consent-manager's participant registry,
-// which translates the consumer DID from the token into the self-description URL
-// a contract names its parties by.
-func participantRegistryHandler(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode([]map[string]string{
-		{"did": itestConsumerDID, "selfDescriptionURL": itestConsumerSD},
+// itestProviderDID is the identifier /participants/me reports for this participant.
+const itestProviderDID = "did:key:zProvider"
+
+// registerParticipantEndpoints serves the participant registry and
+// /participants/me, which every client configuration now calls.
+func registerParticipantEndpoints(mux *http.ServeMux) {
+	mux.HandleFunc("/v1/participants", participantRegistryHandler)
+	mux.HandleFunc("/v1/participants/me", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"identifier": itestProviderDID, "selfDescriptionUri": "http://consent-facade:8080/participants/org-itest",
+		})
 	})
+}
+
+// participantRegistryHandler serves the consent-manager's participant registry,
+// which translates the consumer DID from the token into the self-description URI
+// a contract names its parties by.
+func participantRegistryHandler(w http.ResponseWriter, r *http.Request) {
+	content := []map[string]string{}
+	if r.URL.Query().Get("identifier") == itestConsumerDID {
+		content = append(content, map[string]string{"identifier": itestConsumerDID, "selfDescriptionUri": itestConsumerSD})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{"content": content})
 }
 
 // newFailingConsentManager returns a consent-manager whose CONSENT CHECK calls
@@ -249,7 +266,7 @@ func participantRegistryHandler(w http.ResponseWriter, _ *http.Request) {
 // itself and not the preceding contract lookup.
 func newFailingConsentManager(status int) *httptest.Server {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/participants", participantRegistryHandler)
+	registerParticipantEndpoints(mux)
 	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(status)
 	})
@@ -575,7 +592,7 @@ func newConsentManagerTokenService(t *testing.T, wantSubject, userID, selfDescri
 	mux.HandleFunc("/v1/participants/me", func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, "Bearer itest-token", r.Header.Get("Authorization"))
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{"selfDescriptionURL": selfDescriptionURL})
+		_ = json.NewEncoder(w).Encode(map[string]string{"identifier": itestProviderDID, "selfDescriptionUri": selfDescriptionURL})
 	})
 
 	mux.HandleFunc("/v1/users/identifier/search", func(w http.ResponseWriter, r *http.Request) {
@@ -683,7 +700,7 @@ func perOwnerConsentManager(t *testing.T, statusByOwner map[string]string, asked
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"consents": consentsGrantedTo([]string{status})})
 	})
-	mux.HandleFunc("/v1/participants", participantRegistryHandler)
+	registerParticipantEndpoints(mux)
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return srv
