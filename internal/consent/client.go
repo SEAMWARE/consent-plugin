@@ -72,6 +72,10 @@ const (
 	// scan. Hitting the cap without a match denies.
 	maxConsentListPages = 20
 
+	// consentNotInForceReason is the fixed deny reason for valid:false; the
+	// server's own reason is free text and is only logged at debug level.
+	consentNotInForceReason = "consent not in force (check endpoint)"
+
 	// participantMePath returns the calling participant (identifier and selfDescriptionUri).
 	participantMePath = "/participants/me"
 
@@ -275,7 +279,7 @@ func hashSecret(secret string) string {
 
 // CheckConsent checks req.Subject's consent in req.Mode, allowing only when a
 // consent record passes matchConsent. A missing subject, consumer or (in check
-// mode) notice id is a definite deny, not an error. A 401 triggers one token
+// mode) notice id, or an unknown mode, is a definite deny, not an error. A 401 triggers one token
 // refresh and retry. Other failures are returned as errors (see statusError) so
 // the caller can apply its fail policy.
 func (c *Client) CheckConsent(ctx context.Context, req ConsentRequest) (*ConsentResponse, error) {
@@ -286,6 +290,11 @@ func (c *Client) CheckConsent(ctx context.Context, req ConsentRequest) (*Consent
 	// any consent at all?", which authorises the wrong agreement. Deny instead.
 	if req.Consumer == "" {
 		return deny("no consuming participant identified"), nil
+	}
+	switch req.Mode {
+	case "", ModeList, ModeCheck:
+	default:
+		return deny("unknown consent check mode " + logging.Sanitize(string(req.Mode))), nil
 	}
 	if req.Mode == ModeCheck && req.PrivacyNoticeID == "" {
 		return deny("check mode needs a privacy notice id"), nil
@@ -779,7 +788,11 @@ func (c *Client) checkValidity(ctx context.Context, creds participantCredentials
 		return nil, err
 	}
 	if !validity.Valid {
-		return deny("consent not in force: " + logging.Sanitize(validity.Reason)), nil
+		// reason is free text from a response body, so it stays out of the audit
+		// reason (see unexpectedStatus) and is only logged at debug level.
+		logging.DebugfEvery("consent-check-reason",
+			"consent client: consent check not valid, reason: %s", logging.Sanitize(validity.Reason))
+		return deny(consentNotInForceReason), nil
 	}
 	// consentId comes from a response body and ends up in a URL path.
 	if !IsUUID(validity.ConsentID) {

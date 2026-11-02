@@ -63,6 +63,9 @@ const (
 // consent-manager required; no request may carry such a header any more.
 const legacyConsentKeyMarker = "consent-key"
 
+// malformedJSONBody is a 200 body that does not decode as JSON.
+const malformedJSONBody = `{"content": [`
+
 // writeMe answers /participants/me with this participant's identifier and sd.
 func writeMe(w http.ResponseWriter, sd string) {
 	w.Header().Set("Content-Type", "application/json")
@@ -124,8 +127,11 @@ type mockCM struct {
 	tokenStatus        int                      // non-200 => the token service fails with this status
 	// failStatuses are answered, in order, by the list/check endpoint before it succeeds.
 	failStatuses []int
-	readStatus   int           // non-zero => GET /consents/{id} answers with it
-	delay        time.Duration // delays every consent endpoint
+	readStatus   int // non-zero => GET /consents/{id} answers with it
+	// malformedBody / malformedRead answer 200 with an undecodable body on the
+	// list/check endpoint / the consent read.
+	malformedBody, malformedRead bool
+	delay                        time.Duration // delays every consent endpoint
 	// recording
 	tokenCalls, meCalls, listCalls, checkCalls, readCalls int
 	lastQuery, lastReadQuery                              url.Values
@@ -191,11 +197,15 @@ func newMockCM(t *testing.T, m *mockCM) *httptest.Server {
 		fail := m.nextFailure()
 		consents := append([]consentRecord(nil), m.consents...)
 		size := m.pageSize
-		delay := m.delay
+		delay, malformed := m.delay, m.malformedBody
 		m.mu.Unlock()
 		time.Sleep(delay)
 		if fail != 0 {
 			w.WriteHeader(fail)
+			return
+		}
+		if malformed {
+			writeMalformed(w)
 			return
 		}
 		if size <= 0 {
@@ -219,11 +229,15 @@ func newMockCM(t *testing.T, m *mockCM) *httptest.Server {
 		m.lastQuery = r.URL.Query()
 		fail := m.nextFailure()
 		validity := m.validity
-		delay := m.delay
+		delay, malformed := m.delay, m.malformedBody
 		m.mu.Unlock()
 		time.Sleep(delay)
 		if fail != 0 {
 			w.WriteHeader(fail)
+			return
+		}
+		if malformed {
+			writeMalformed(w)
 			return
 		}
 		writeJSON(w, map[string]any{
@@ -238,11 +252,13 @@ func newMockCM(t *testing.T, m *mockCM) *httptest.Server {
 		m.record(r)
 		m.lastReadQuery = r.URL.Query()
 		record, found := m.byID[r.PathValue("id")]
-		status := m.readStatus
+		status, malformed := m.readStatus, m.malformedRead
 		m.mu.Unlock()
 		switch {
 		case status != 0:
 			w.WriteHeader(status)
+		case malformed:
+			writeMalformed(w)
 		case !found:
 			w.WriteHeader(http.StatusNotFound)
 		default:
@@ -253,6 +269,12 @@ func newMockCM(t *testing.T, m *mockCM) *httptest.Server {
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return srv
+}
+
+// writeMalformed answers 200 with a body that does not decode as JSON.
+func writeMalformed(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write([]byte(malformedJSONBody))
 }
 
 // grantingMock serves grantedConsent in both modes.
@@ -277,14 +299,6 @@ func tokenServiceClient(srvURL string) *Client {
 
 // bothModes are the modes every mode-independent behaviour is checked in.
 var bothModes = []Mode{ModeList, ModeCheck}
-
-// modeName names a mode for subtest names.
-func modeName(mode Mode) string {
-	if mode == ModeList {
-		return "list"
-	}
-	return string(mode)
-}
 
 // resetCredCache clears the package-wide caches between tests.
 func resetCredCache() { ResetCaches() }
@@ -499,8 +513,8 @@ func TestCheckConsent_CheckMode(t *testing.T) {
 			wantDecision: DecisionDeny, wantReason: "does not match", wantRead: true,
 		},
 		{
-			name: "not valid", validity: consentValidity{Valid: false, Reason: "No consent is in force."},
-			wantDecision: DecisionDeny, wantReason: "No consent is in force.",
+			name: "not valid", validity: consentValidity{Valid: false, Reason: "No consent is in force for did:key:zOwner."},
+			wantDecision: DecisionDeny, wantReason: consentNotInForceReason,
 		},
 		{
 			name: "valid without consentId", validity: consentValidity{Valid: true},
@@ -536,6 +550,9 @@ func TestCheckConsent_CheckMode(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, tt.wantDecision, resp.Decision)
 			assert.Contains(t, resp.Reason, tt.wantReason)
+			if tt.validity.Reason != "" {
+				assert.NotContains(t, resp.Reason, tt.validity.Reason, "the server's free-text reason stays out of the verdict")
+			}
 			if tt.wantDecision == DecisionAllow {
 				assert.Equal(t, testConsentID, resp.ConsentID)
 			}
@@ -558,6 +575,24 @@ func TestCheckConsent_CheckMode(t *testing.T) {
 	}
 }
 
+// TestCheckConsent_ZeroModeIsList verifies an unset Mode is list mode.
+func TestCheckConsent_ZeroModeIsList(t *testing.T) {
+	resetCredCache()
+	m := grantingMock()
+	srv := newMockCM(t, m)
+	req := matchingRequest(ModeList)
+	req.Mode = ""
+
+	resp, err := staticClient(srv.URL).CheckConsent(context.Background(), req)
+	require.NoError(t, err)
+	assert.Equal(t, DecisionAllow, resp.Decision)
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	assert.Equal(t, 1, m.listCalls)
+	assert.Zero(t, m.checkCalls)
+}
+
 // TestCheckConsent_RequestGuards verifies the requests that deny before any call.
 func TestCheckConsent_RequestGuards(t *testing.T) {
 	tests := []struct {
@@ -571,6 +606,7 @@ func TestCheckConsent_RequestGuards(t *testing.T) {
 			r.Mode, r.PrivacyNoticeID = ModeCheck, ""
 		}, wantReason: "needs a privacy notice id"},
 		{name: "non-UUID notice id", req: func(r *ConsentRequest) { r.PrivacyNoticeID = "notice-1" }, wantReason: "not a UUID"},
+		{name: "unknown mode", req: func(r *ConsentRequest) { r.Mode = "lsit" }, wantReason: "unknown consent check mode"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -598,7 +634,9 @@ func TestCheckConsent_StatusMapping(t *testing.T) {
 	tests := []struct {
 		name           string
 		failStatuses   []int
-		readStatus     int // check mode only
+		readStatus     int  // check mode only
+		malformedBody  bool // 200 with an undecodable body on the list/check endpoint
+		malformedRead  bool // check mode only
 		wantAllow      bool
 		wantSentinel   error
 		wantTokenCalls int
@@ -616,16 +654,19 @@ func TestCheckConsent_StatusMapping(t *testing.T) {
 		{name: "403 on the consent read", readStatus: http.StatusForbidden, wantSentinel: ErrConsentManagerAuth, wantTokenCalls: 1},
 		{name: "400 on the consent read", readStatus: http.StatusBadRequest, wantSentinel: ErrConsentManagerRejected, wantTokenCalls: 1},
 		{name: "500 on the consent read", readStatus: http.StatusInternalServerError, wantTokenCalls: 1},
+		{name: "malformed 200 body", malformedBody: true, wantTokenCalls: 1},
+		{name: "malformed 200 body on the consent read", malformedRead: true, wantTokenCalls: 1},
 	}
 	for _, mode := range bothModes {
 		for _, tt := range tests {
-			if tt.readStatus != 0 && mode != ModeCheck {
+			if (tt.readStatus != 0 || tt.malformedRead) && mode != ModeCheck {
 				continue
 			}
-			t.Run(modeName(mode)+"/"+tt.name, func(t *testing.T) {
+			t.Run(string(mode)+"/"+tt.name, func(t *testing.T) {
 				resetCredCache()
 				m := grantingMock()
 				m.failStatuses, m.readStatus = tt.failStatuses, tt.readStatus
+				m.malformedBody, m.malformedRead = tt.malformedBody, tt.malformedRead
 				srv := newMockCM(t, m)
 
 				resp, err := tokenServiceClient(srv.URL).CheckConsent(context.Background(), matchingRequest(mode))
@@ -658,7 +699,7 @@ func TestCheckConsent_Timeout(t *testing.T) {
 		serverDelay     = 200 * time.Millisecond
 	)
 	for _, mode := range bothModes {
-		t.Run(modeName(mode), func(t *testing.T) {
+		t.Run(string(mode), func(t *testing.T) {
 			resetCredCache()
 			m := grantingMock()
 			m.delay = serverDelay
@@ -678,7 +719,7 @@ func TestCheckConsent_Timeout(t *testing.T) {
 // token and no legacy consent-key header.
 func TestCheckConsent_BearerOnly(t *testing.T) {
 	for _, mode := range bothModes {
-		t.Run(modeName(mode), func(t *testing.T) {
+		t.Run(string(mode), func(t *testing.T) {
 			resetCredCache()
 			m := grantingMock()
 			srv := newMockCM(t, m)
@@ -700,7 +741,7 @@ func TestCheckConsent_BearerOnly(t *testing.T) {
 // TestCheckConsent_NotCached verifies a revocation takes effect on the next check.
 func TestCheckConsent_NotCached(t *testing.T) {
 	for _, mode := range bothModes {
-		t.Run(modeName(mode), func(t *testing.T) {
+		t.Run(string(mode), func(t *testing.T) {
 			resetCredCache()
 			m := grantingMock()
 			srv := newMockCM(t, m)

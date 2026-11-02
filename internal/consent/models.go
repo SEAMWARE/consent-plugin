@@ -38,10 +38,11 @@ const (
 // Mode selects how a ConsentRequest is checked against the consent-manager.
 type Mode string
 
-// Mode constants. ModeList is the zero value, so an unset Mode is list mode.
+// Mode constants. Their values equal the plugin's check_mode values, so a validated
+// config value converts directly. An unset Mode is list mode; any other value denies.
 const (
 	// ModeList pages through GET /consents?userIdentifier= and matches each record.
-	ModeList Mode = ""
+	ModeList Mode = "list"
 
 	// ModeCheck asks GET /consents/check and then reads the named consent to
 	// match it. It requires PrivacyNoticeID.
