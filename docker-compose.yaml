@@ -5,7 +5,7 @@
 #   # then create the gated route (see README, "Local Development with Docker Compose")
 #
 # The stack is self-contained: APISIX and its etcd, the plugin runner, a mock
-# consent-manager + OwnerResolver + token service, an upstream that returns
+# dsc-consent-manager + OwnerResolver + token service, an upstream that returns
 # personal data, and an OTel Collector to receive the access-decision audit log.
 #
 # Note the socket wiring. APISIX and the runner share a DIRECTORY (the
@@ -66,7 +66,6 @@ services:
       APISIX_LISTEN_ADDRESS: "unix:/opt/runner/runner.sock"
       # Credentials the plugin reads from the environment rather than the route
       # config, mirroring how the Kubernetes deployment sources them from a Secret.
-      CONSENT_KEY: "dev-consent-key"
       CONSENT_TOKEN_SERVICE_URL: "http://mock:8080/internal/tokens"
       CONSENT_AUDIT_OTLP_ENDPOINT: "http://otel-collector:4318"
       # Prometheus metrics, off unless an address is set.
@@ -75,8 +74,9 @@ services:
       - "9091:9091"   # Prometheus metrics
     restart: on-failure
 
-  # Mock consent-manager, OwnerResolver and participant token service. The
-  # stubs live in dev/mocks/ — edit consents.json to flip the gate's answer.
+  # Mock dsc-consent-manager, OwnerResolver and participant token service. The
+  # stubs live in dev/mocks/ — edit consents.json (check_mode=list, the default)
+  # or consents-check.json (check_mode=check) to flip the gate's answer.
   mock:
     image: wiremock/wiremock:3.9.1
     command: ["--port", "8080", "--verbose"]

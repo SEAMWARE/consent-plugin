@@ -367,6 +367,8 @@ Files: `dev/mocks/*.json`, `docker-compose.yaml`, `README.md`, `AGENTS.md`.
   - Add a migration note listing the removed options (`consent_api_host`, `consent_key`,
     `CONSENT_KEY`) and stating that this is a **major** release.
 - `AGENTS.md`: drop the "Migration in progress" note and describe the final flow.
+  **Deferred to plan mode:** step agents must not edit `AGENTS.md`, so the Step 6 PR leaves
+  it unchanged and hands this item to a plan-mode agent through a `[plan-update]` comment.
 - Acceptance: `make test lint license-check` pass, `docker compose config` validates, and
   nothing in the repo still mentions Visions-only concepts except the migration note. The
   work→main PR must carry the `major` label so the release workflow publishes the new image

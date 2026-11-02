@@ -1,0 +1,32 @@
+{
+  "name": "consent check (check mode)",
+  "metadata": {
+    "comment": "GET /consents/check?userIdentifier&privacyNoticeId[&purpose] - check mode (check_mode=check). Names the consent consent-by-id.json returns, which the plugin then matches on provider and consumer. Set valid to false to watch the gate deny."
+  },
+  "request": {
+    "method": "GET",
+    "urlPath": "/v1/consents/check",
+    "queryParameters": {
+      "userIdentifier": {
+        "equalTo": "did:key:zDevOwner"
+      },
+      "privacyNoticeId": {
+        "equalTo": "5f1d2c3b-4a59-4e6f-8a7b-9c0d1e2f3a4b"
+      }
+    }
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store"
+    },
+    "jsonBody": {
+      "valid": true,
+      "consentId": "0b7c6f3e-2d5a-4c1e-9f8b-7a6d5c4b3a21",
+      "status": "GRANTED",
+      "purposes": ["Dev profile processing"],
+      "checkedAt": "2026-11-02T00:00:00Z"
+    }
+  }
+}
