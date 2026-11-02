@@ -43,6 +43,10 @@ func TestRenderExposition(t *testing.T) {
 	RecordDependencyCall(DependencyConsentManager, OutcomeSuccess, 20*time.Millisecond)
 	RecordDependencyCall(DependencyConsentManager, OutcomeError, 3*time.Second)
 
+	RecordPurposeUnconstrained()
+	RecordContractUnconstrained()
+	RecordContractUnconstrained()
+
 	RegisterGauge(ContextStoreSizeGauge, "Request contexts currently held.", func() float64 { return 7 })
 	RegisterCounter(ContextEvictedCounter, "Request contexts evicted.", func() float64 { return 3 })
 
@@ -60,6 +64,10 @@ func TestRenderExposition(t *testing.T) {
 	assert.Contains(t, out, `consent_dependency_duration_seconds_bucket{dependency="consent_manager",le="5"} 2`)
 	assert.Contains(t, out, `consent_dependency_duration_seconds_bucket{dependency="consent_manager",le="+Inf"} 2`)
 	assert.Contains(t, out, `consent_dependency_duration_seconds_count{dependency="consent_manager"} 2`)
+
+	assert.Contains(t, out, "consent_purpose_unconstrained_total 1")
+	assert.Contains(t, out, "consent_contract_unconstrained_total 2")
+	assert.Contains(t, out, "# TYPE consent_contract_unconstrained_total counter")
 
 	assert.Contains(t, out, "consent_request_context_store_size 7")
 	assert.Contains(t, out, "# TYPE consent_decisions_total counter")
