@@ -1,7 +1,7 @@
 {
-  "name": "provider self-description",
+  "name": "calling participant",
   "metadata": {
-    "comment": "GET /participants/me - the provider self-description the identifier search is scoped by."
+    "comment": "GET /participants/me - this provider. identifier is the provider every matched consent must name; selfDescriptionUri is sent to the OwnerResolver as parties.provider."
   },
   "request": {
     "method": "GET",
@@ -13,7 +13,8 @@
       "Content-Type": "application/json"
     },
     "jsonBody": {
-      "selfDescriptionURL": "http://mock:8080/participants/dev-provider"
+      "identifier": "did:key:zDevProvider",
+      "selfDescriptionUri": "http://mock:8080/participants/dev-provider"
     }
   }
 }

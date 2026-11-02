@@ -1,7 +1,7 @@
 {
   "name": "owner resolver",
   "metadata": {
-    "comment": "POST /resolve - the OwnerResolver. It answers from the DATA who the owner is; here it always reports the same owner so the stack has a working happy path."
+    "comment": "POST /resolve - the OwnerResolver. It answers from the DATA who the owner is; here it always reports the same owner, scoped to the dev contract, its privacy notice and purpose, so the stack has a working happy path in both check modes."
   },
   "request": {
     "method": "POST",
@@ -20,7 +20,10 @@
             "type": "jsonpath",
             "value": "$.id"
           },
-          "ownerId": "did:key:zDevOwner"
+          "ownerId": "did:key:zDevOwner",
+          "purpose": "Dev profile processing",
+          "contractUri": "http://mock:8080/contracts/dev-contract",
+          "privacyNoticeId": "5f1d2c3b-4a59-4e6f-8a7b-9c0d1e2f3a4b"
         }
       ]
     }

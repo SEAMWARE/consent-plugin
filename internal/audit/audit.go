@@ -134,6 +134,9 @@ type Event struct {
 	Decision string
 	// Reason is a short human-readable explanation of the decision.
 	Reason string
+	// ConsentID is the consent an allow was matched on, so its receipt can be
+	// fetched later by id. Empty on a deny; the attribute is then omitted.
+	ConsentID string
 }
 
 // Emitter asynchronously exports audit Events as OTLP log records to a Collector.
@@ -399,6 +402,9 @@ type anyValue struct {
 	StringValue string `json:"stringValue"`
 }
 
+// consentIDAttribute names the log attribute carrying Event.ConsentID.
+const consentIDAttribute = "consent.id"
+
 // buildPayload maps a batch of events to a single OTLP logs payload. The routing
 // marker lives on the resource (service.name); the per-decision fields are log
 // attributes using OpenTelemetry semantic-convention keys where they exist.
@@ -406,22 +412,26 @@ func (e *Emitter) buildPayload(batch []Event) otlpPayload {
 	records := make([]logRecord, 0, len(batch))
 	for _, ev := range batch {
 		ts := strconv.FormatInt(ev.Time.UnixNano(), 10)
+		attributes := []keyValue{
+			{Key: "event.domain", Value: anyValue{StringValue: "audit"}},
+			{Key: "event.name", Value: anyValue{StringValue: "consent.access.decision"}},
+			{Key: "consent.decision", Value: anyValue{StringValue: ev.Decision}},
+			{Key: "consent.reason", Value: anyValue{StringValue: ev.Reason}},
+			{Key: "enduser.id", Value: anyValue{StringValue: ev.Subject}},
+			{Key: "http.request.method", Value: anyValue{StringValue: ev.Method}},
+			{Key: "url.path", Value: anyValue{StringValue: ev.Resource}},
+			{Key: "http.request.id", Value: anyValue{StringValue: ev.RequestID}},
+		}
+		if ev.ConsentID != "" {
+			attributes = append(attributes, keyValue{Key: consentIDAttribute, Value: anyValue{StringValue: ev.ConsentID}})
+		}
 		records = append(records, logRecord{
 			TimeUnixNano:         ts,
 			ObservedTimeUnixNano: ts,
 			SeverityNumber:       severityInfo,
 			SeverityText:         "INFO",
 			Body:                 anyValue{StringValue: "consent access decision"},
-			Attributes: []keyValue{
-				{Key: "event.domain", Value: anyValue{StringValue: "audit"}},
-				{Key: "event.name", Value: anyValue{StringValue: "consent.access.decision"}},
-				{Key: "consent.decision", Value: anyValue{StringValue: ev.Decision}},
-				{Key: "consent.reason", Value: anyValue{StringValue: ev.Reason}},
-				{Key: "enduser.id", Value: anyValue{StringValue: ev.Subject}},
-				{Key: "http.request.method", Value: anyValue{StringValue: ev.Method}},
-				{Key: "url.path", Value: anyValue{StringValue: ev.Resource}},
-				{Key: "http.request.id", Value: anyValue{StringValue: ev.RequestID}},
-			},
+			Attributes:           attributes,
 		})
 	}
 	return otlpPayload{ResourceLogs: []resourceLogs{{

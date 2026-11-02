@@ -73,11 +73,18 @@ type Claim struct {
 	// DataResource, when set, scopes the consent match to one resource.
 	DataResource string `json:"dataResource,omitempty"`
 
-	// Purpose names the processing purpose (or contract) governing this claim,
-	// when the resolver could identify the contract from the parties. It scopes
-	// the consent match: a granted consent counts only if it covers this purpose.
-	// Empty means the purpose is unknown and only the consumer match applies.
+	// Purpose names the processing purpose governing this claim, when the
+	// resolver could identify the contract from the parties. It scopes the consent
+	// match verbatim against a consent's purposes[], so it must be the notice's
+	// purpose string. Empty means the purpose is unknown.
 	Purpose string `json:"purpose,omitempty"`
+
+	// ContractURI, when set, scopes the consent match to consents under this contract.
+	ContractURI string `json:"contractUri,omitempty"`
+
+	// PrivacyNoticeID, when set, scopes the consent match to consents decided
+	// against this notice (a UUID). check_mode=check requires it or a route-level one.
+	PrivacyNoticeID string `json:"privacyNoticeId,omitempty"`
 }
 
 // Result is the OwnerResolver response.

@@ -211,6 +211,8 @@ type checkedOwner struct {
 	resource string
 	decision string
 	reason   string
+	// consentID is the consent an allow matched, so its receipt can be fetched later.
+	consentID string
 }
 
 // ResponseFilter gates the upstream response on the data owner's consent.
@@ -219,8 +221,8 @@ type checkedOwner struct {
 //  1. Correlate with the request phase and load (and delete) the stored context.
 //  2. Ask the OwnerResolver, from the RESPONSE DATA, whether consent is required
 //     and who the data owner(s) are.
-//  3. Run the two-call consent check per resolved owner (deny_all: every owner
-//     must have a granted consent).
+//  3. Check each resolved owner's consent in check_mode (deny_all: every owner
+//     must have a matching granted consent).
 //  4. Allow → pass the response through unchanged; deny → replace it with the
 //     configured denial response.
 //  5. On unresolved context, a resolver error, or a consent-manager error, apply
@@ -279,7 +281,7 @@ func (c *ConsentFilter) evaluate(cfg *Config, w pkgHTTP.Response) responseOutcom
 
 // evaluateWithResolver reads the upstream body, asks the OwnerResolver who owns
 // the data (and whether consent is required), and enforces deny_all: every
-// distinct (owner, dataResource) claim must have a granted consent, or the whole
+// distinct claim (see distinctClaims) must have a granted consent, or the whole
 // response is denied. The requestor identity is never consulted for ownership.
 func (c *ConsentFilter) evaluateWithResolver(cfg *Config, w pkgHTTP.Response, key string, reqCtx *RequestContext, consentClient *consent.Client) responseOutcome {
 	// One deadline for the whole phase. Every call below derives from it, so the
@@ -363,11 +365,17 @@ func (c *ConsentFilter) evaluateWithResolver(cfg *Config, w pkgHTTP.Response, ke
 		return failOutcome(cfg, failAlwaysClosed, "consent required but no data owner resolved", key, nil)
 	}
 
-	claims, err := distinctClaims(result.Claims)
+	claims, err := distinctClaims(cfg, result.Claims)
 	if err != nil {
 		return failOutcome(cfg, failAlwaysClosed, err.Error(), key, nil)
 	}
+	if outcome, ok := checkModeScoping(cfg, key, claims); !ok {
+		return outcome
+	}
 	if outcome, ok := checkPurposeScoping(cfg, key, claims); !ok {
+		return outcome
+	}
+	if outcome, ok := checkContractScoping(cfg, key, claims); !ok {
 		return outcome
 	}
 
@@ -379,7 +387,7 @@ func (c *ConsentFilter) evaluateWithResolver(cfg *Config, w pkgHTTP.Response, ke
 			key, nil)
 	}
 
-	return checkOwners(phaseCtx, cfg, key, reqCtx, consentClient, claims, consumerSD)
+	return checkOwners(phaseCtx, cfg, key, reqCtx, consentClient, claims, consumerDID)
 }
 
 // checkPurposeScoping reports whether every resolved claim carries a processing
@@ -405,31 +413,97 @@ func checkPurposeScoping(cfg *Config, key string, claims []ownerClaim) (response
 	return responseOutcome{}, true
 }
 
-// ownerClaim is one distinct (owner, dataResource) pair to check.
-type ownerClaim struct {
-	owner        string
-	dataResource string
-	purpose      string
+// checkContractScoping reports whether every claim is scoped to a contract or a
+// privacy notice, and what to do when one is not.
+//
+// An unscoped claim matches any consent from this owner to this consumer under
+// this provider, whatever agreement it was granted for. With require_contract
+// set that denies, regardless of the fail policy, like require_purpose. Otherwise
+// the check proceeds and is counted, so the gap is alertable until the resolver
+// emits a contractUri or privacyNoticeId and require_contract can be enabled.
+func checkContractScoping(cfg *Config, key string, claims []ownerClaim) (responseOutcome, bool) {
+	for _, claim := range claims {
+		if claim.contractURI != "" || claim.privacyNoticeID != "" {
+			continue
+		}
+		if cfg.RequireContract {
+			logging.WarnfEvery("contract-required", "ResponseFilter: resolved claim without a contract or privacy notice for request %s and require_contract is set; denying", key)
+			return failOutcome(cfg, failAlwaysClosed, "resolved claim without a contract or privacy notice", key, nil), false
+		}
+		metrics.RecordContractUnconstrained()
+		logging.WarnfEvery("contract-unconstrained", "ResponseFilter: the resolver named no contract or privacy notice, so consent is matched on any agreement with the consumer; set require_contract once the resolver emits one")
+	}
+	return responseOutcome{}, true
 }
 
-// distinctClaims collapses the resolver's claims to the distinct
-// (owner, dataResource) pairs that must be checked, preserving the resolver's
-// order so the reported denial is stable. A claim naming no owner is an error:
-// the resolver said consent is required but not whose.
-func distinctClaims(claims []ownerresolver.Claim) ([]ownerClaim, error) {
-	type pair struct{ owner, resource string }
-	seen := make(map[pair]bool, len(claims))
+// checkModeScoping denies, regardless of the fail policy, when check mode is
+// configured and a claim has no privacy notice id: /consents/check requires one,
+// so the check cannot be made at all.
+func checkModeScoping(cfg *Config, key string, claims []ownerClaim) (responseOutcome, bool) {
+	if cfg.CheckMode != CheckModeCheck {
+		return responseOutcome{}, true
+	}
+	for _, claim := range claims {
+		if claim.privacyNoticeID == "" {
+			logging.WarnfEvery("check-mode-notice", "ResponseFilter: check_mode=check but a resolved claim for request %s names no privacy notice and privacy_notice_id is unset; denying", key)
+			return failOutcome(cfg, failAlwaysClosed, "check_mode=check needs a privacy notice id", key, nil), false
+		}
+	}
+	return responseOutcome{}, true
+}
+
+// ownerClaim is one distinct consent question: an owner and resource under an
+// effective purpose, contract and privacy notice.
+type ownerClaim struct {
+	owner           string
+	dataResource    string
+	purpose         string
+	contractURI     string
+	privacyNoticeID string
+}
+
+// effectivePurpose is the claim's purpose, else the route-level purpose.
+func effectivePurpose(cfg *Config, claim ownerresolver.Claim) string {
+	if claim.Purpose != "" {
+		return claim.Purpose
+	}
+	return cfg.Purpose
+}
+
+// effectiveNoticeID is the claim's privacy notice id, else the route-level one.
+// It is lower-cased like the config value, so a UUID matches whatever its case.
+func effectiveNoticeID(cfg *Config, claim ownerresolver.Claim) string {
+	if claim.PrivacyNoticeID != "" {
+		return strings.ToLower(claim.PrivacyNoticeID)
+	}
+	return cfg.PrivacyNoticeID
+}
+
+// distinctClaims collapses the resolver's claims to the distinct consent
+// questions, preserving the resolver's order so the reported denial is stable.
+// The key includes every match criterion after the config fallbacks: dropping
+// one would let a grant for purpose A stand in for a missing grant for purpose
+// B. A claim naming no owner is an error: the resolver said consent is required
+// but not whose.
+func distinctClaims(cfg *Config, claims []ownerresolver.Claim) ([]ownerClaim, error) {
+	seen := make(map[ownerClaim]bool, len(claims))
 	distinct := make([]ownerClaim, 0, len(claims))
 	for _, claim := range claims {
 		if claim.OwnerID == "" {
 			return nil, errors.New("resolved claim without a data owner")
 		}
-		p := pair{owner: claim.OwnerID, resource: claim.DataResource}
-		if seen[p] {
+		c := ownerClaim{
+			owner:           claim.OwnerID,
+			dataResource:    claim.DataResource,
+			purpose:         effectivePurpose(cfg, claim),
+			contractURI:     claim.ContractURI,
+			privacyNoticeID: effectiveNoticeID(cfg, claim),
+		}
+		if seen[c] {
 			continue
 		}
-		seen[p] = true
-		distinct = append(distinct, ownerClaim{owner: claim.OwnerID, dataResource: claim.DataResource, purpose: claim.Purpose})
+		seen[c] = true
+		distinct = append(distinct, c)
 	}
 	return distinct, nil
 }
@@ -456,7 +530,7 @@ const maxConcurrentConsentChecks = 8
 // could return would change the answer. The results are then reduced by
 // reduceOwnerResults, which ranks them so the verdict does not depend on which
 // goroutine happened to finish first.
-func checkOwners(ctx context.Context, cfg *Config, key string, reqCtx *RequestContext, client *consent.Client, claims []ownerClaim, consumerSD string) responseOutcome {
+func checkOwners(ctx context.Context, cfg *Config, key string, reqCtx *RequestContext, client *consent.Client, claims []ownerClaim, consumerDID string) responseOutcome {
 	results := make([]ownerCheckResult, len(claims))
 	checksCtx, cancelChecks := context.WithCancel(ctx)
 	defer cancelChecks()
@@ -480,8 +554,12 @@ func checkOwners(ctx context.Context, cfg *Config, key string, reqCtx *RequestCo
 				Resource:     reqCtx.Path,
 				Method:       reqCtx.Method,
 				DataResource: claim.dataResource,
-				Consumer:     consumerSD,
+				Consumer:     consumerDID,
 				Purpose:      claim.purpose,
+				// Validate restricts check_mode to the Mode values.
+				Mode:            consent.Mode(cfg.CheckMode),
+				PrivacyNoticeID: claim.privacyNoticeID,
+				ContractURI:     claim.contractURI,
 			}
 			results[i].attempted = true
 			results[i].request = req
@@ -510,6 +588,7 @@ func checkOwners(ctx context.Context, cfg *Config, key string, reqCtx *RequestCo
 			default:
 				results[i].record = checkedOwner{
 					subject: claim.owner, resource: ownerResource, decision: decisionAllow, reason: resp.Reason,
+					consentID: resp.ConsentID,
 				}
 			}
 			if results[i].problem {
@@ -570,6 +649,8 @@ func reduceOwnerResults(cfg *Config, key string, reqCtx *RequestContext, phaseEr
 
 	for _, result := range results {
 		if result.attempted && result.problem && result.err == nil {
+			logging.WarnfEvery("consent-deny", "ResponseFilter: consent denied for request %s: %s",
+				key, logging.Sanitize(result.outcome.reason))
 			outcome := result.outcome
 			outcome.checked = checked
 			return outcome
@@ -585,9 +666,18 @@ func reduceOwnerResults(cfg *Config, key string, reqCtx *RequestContext, phaseEr
 		if errors.Is(result.err, context.Canceled) && phaseErr == nil {
 			continue
 		}
-		logging.ErrorfEvery("consent-check", "ResponseFilter: consent check error for request %s: %s", key, logging.Sanitize(result.err.Error()))
+		mode := failModeForError(result.err)
+		if mode == failAlwaysClosed {
+			// Retrying will not fix refused credentials or a rejected request, so
+			// this reads as a misconfiguration to fix, not an outage to wait out.
+			logging.ErrorfEvery("consent-auth", "ResponseFilter: consent check config/auth error for request %s (not retryable, denying): %s",
+				key, logging.Sanitize(result.err.Error()))
+		} else {
+			logging.ErrorfEvery("consent-check", "ResponseFilter: consent check error for request %s (retryable, fail policy applies): %s",
+				key, logging.Sanitize(result.err.Error()))
+		}
 		req := result.request
-		outcome := failOutcome(cfg, failModeForError(result.err), "consent check error: "+result.err.Error(), key, &req)
+		outcome := failOutcome(cfg, mode, "consent check error: "+result.err.Error(), key, &req)
 		outcome.checked = checked
 		return outcome
 	}
@@ -598,9 +688,7 @@ func reduceOwnerResults(cfg *Config, key string, reqCtx *RequestContext, phaseEr
 func clientConfigFromCfg(cfg *Config) consent.ClientConfig {
 	return consent.ClientConfig{
 		BaseURL:          cfg.ConsentAPIURL,
-		Host:             cfg.ConsentAPIHost,
 		APIPrefix:        cfg.ConsentAPIPrefix,
-		ConsentKey:       cfg.ConsentKey,
 		ProviderSD:       cfg.ProviderSD,
 		ParticipantToken: cfg.ParticipantToken,
 		TokenServiceURL:  cfg.TokenServiceURL,
@@ -665,13 +753,21 @@ func failOutcome(cfg *Config, mode failMode, reason, requestID string, req *cons
 }
 
 // failModeForError maps a dependency error to its fail mode. A missing
-// credential or a consumer that is not in the participant registry is a
+// credential, a consumer that is not in the participant registry, refused
+// credentials or a consent-manager that rejects the request outright is a
 // permanent misconfiguration: retrying will not fix it, so failing it open would
 // not ride out an outage, it would grant that consumer standing access. Anything
 // else is treated as an outage the operator's policy governs.
 func failModeForError(err error) failMode {
-	if errors.Is(err, consent.ErrNoCredentials) || errors.Is(err, consent.ErrParticipantNotRegistered) {
-		return failAlwaysClosed
+	for _, permanent := range []error{
+		consent.ErrNoCredentials,
+		consent.ErrParticipantNotRegistered,
+		consent.ErrConsentManagerAuth,
+		consent.ErrConsentManagerRejected,
+	} {
+		if errors.Is(err, permanent) {
+			return failAlwaysClosed
+		}
 	}
 	return failByPolicy
 }
@@ -717,6 +813,7 @@ func recordAudit(cfg *Config, outcome responseOutcome) {
 			Method:    outcome.method,
 			Decision:  checked.decision,
 			Reason:    checked.reason,
+			ConsentID: checked.consentID,
 		})
 	}
 }

@@ -72,6 +72,46 @@ func TestResolve_SendsBodyAndParsesClaims(t *testing.T) {
 	}
 }
 
+// TestResolve_DecodesClaimScope verifies the optional purpose, contract and
+// notice fields reach the plugin, and are empty when the resolver omits them.
+func TestResolve_DecodesClaimScope(t *testing.T) {
+	tests := []struct {
+		name  string
+		claim string
+		want  Claim
+	}{
+		{
+			name:  "all scope fields",
+			claim: `{"ownerId":"alice-42","purpose":"Trip planning","contractUri":"https://contracts.example/c1","privacyNoticeId":"3f1e2d4c-5b6a-4789-8abc-def012345678"}`,
+			want: Claim{
+				OwnerID: "alice-42", Purpose: "Trip planning",
+				ContractURI: "https://contracts.example/c1", PrivacyNoticeID: "3f1e2d4c-5b6a-4789-8abc-def012345678",
+			},
+		},
+		{
+			name:  "no scope fields",
+			claim: `{"ownerId":"alice-42"}`,
+			want:  Claim{OwnerID: "alice-42"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(`{"consentRequired":true,"claims":[` + tt.claim + `]}`))
+			}))
+			defer srv.Close()
+
+			res, err := NewClient(srv.URL+resolvePath, 0).Resolve(context.Background(), Resource{}, Parties{}, nil)
+			if err != nil {
+				t.Fatalf("Resolve: %v", err)
+			}
+			if len(res.Claims) != 1 || res.Claims[0] != tt.want {
+				t.Fatalf("got %+v, want %+v", res.Claims, tt.want)
+			}
+		})
+	}
+}
+
 func TestResolve_NoBodyUsesEncodingNone(t *testing.T) {
 	var gotReq resolveRequest
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
