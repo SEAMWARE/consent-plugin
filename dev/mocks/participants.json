@@ -1,22 +1,33 @@
 {
   "name": "participant registry",
   "metadata": {
-    "comment": "GET /participants - the registry that maps the consumer DID from the token to the self-description URL a contract names its parties by."
+    "comment": "GET /participants?identifier={DID} - the registry that maps the consumer DID from the token to the self-description URI sent to the OwnerResolver as parties.consumer. Set deregisteredAt to watch the gate deny."
   },
   "request": {
     "method": "GET",
-    "url": "/v1/participants"
+    "urlPath": "/v1/participants",
+    "queryParameters": {
+      "identifier": {
+        "equalTo": "did:key:zDevConsumer"
+      }
+    }
   },
   "response": {
     "status": 200,
     "headers": {
       "Content-Type": "application/json"
     },
-    "jsonBody": [
-      {
-        "did": "did:key:zDevConsumer",
-        "selfDescriptionURL": "http://mock:8080/participants/dev-consumer"
-      }
-    ]
+    "jsonBody": {
+      "content": [
+        {
+          "identifier": "did:key:zDevConsumer",
+          "selfDescriptionUri": "http://mock:8080/participants/dev-consumer"
+        }
+      ],
+      "page": 0,
+      "size": 20,
+      "totalElements": 1,
+      "totalPages": 1
+    }
   }
 }

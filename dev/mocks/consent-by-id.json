@@ -1,0 +1,32 @@
+{
+  "name": "consent read (check mode)",
+  "metadata": {
+    "comment": "GET /consents/{id}?format=full - the read check mode always makes after valid:true, so the consumer can be verified. Same record as consents.json."
+  },
+  "request": {
+    "method": "GET",
+    "urlPath": "/v1/consents/0b7c6f3e-2d5a-4c1e-9f8b-7a6d5c4b3a21",
+    "queryParameters": {
+      "format": {
+        "equalTo": "full"
+      }
+    }
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "jsonBody": {
+      "id": "0b7c6f3e-2d5a-4c1e-9f8b-7a6d5c4b3a21",
+      "privacyNoticeId": "5f1d2c3b-4a59-4e6f-8a7b-9c0d1e2f3a4b",
+      "status": "GRANTED",
+      "consented": true,
+      "provider": "did:key:zDevProvider",
+      "consumer": "did:key:zDevConsumer",
+      "purposes": ["Dev profile processing"],
+      "data": ["Profile records"],
+      "contractUri": "http://mock:8080/contracts/dev-contract"
+    }
+  }
+}

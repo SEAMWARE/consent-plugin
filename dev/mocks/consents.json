@@ -1,11 +1,16 @@
 {
-  "name": "owner consents",
+  "name": "owner consents (list mode)",
   "metadata": {
-    "comment": "GET /consents/participants/{id}?receipt=true - the owner's consents. Granted TO dev-consumer, which is what makes the check pass; change the consumer here, or the status to revoked, to watch the gate deny."
+    "comment": "GET /consents?userIdentifier={owner DID} - list mode. One GRANTED consent the owner gave dev-consumer under dev-provider's contract, which is what makes the check pass. Set consented to false, or change provider or consumer, and restart the mock to watch the gate deny."
   },
   "request": {
     "method": "GET",
-    "urlPathPattern": "/v1/consents/participants/.*"
+    "urlPath": "/v1/consents",
+    "queryParameters": {
+      "userIdentifier": {
+        "equalTo": "did:key:zDevOwner"
+      }
+    }
   },
   "response": {
     "status": 200,
@@ -13,14 +18,23 @@
       "Content-Type": "application/json"
     },
     "jsonBody": {
-      "consents": [
+      "content": [
         {
-          "status": "granted",
-          "consumer": {
-            "selfDescriptionURL": "http://mock:8080/participants/dev-consumer"
-          }
+          "id": "0b7c6f3e-2d5a-4c1e-9f8b-7a6d5c4b3a21",
+          "privacyNoticeId": "5f1d2c3b-4a59-4e6f-8a7b-9c0d1e2f3a4b",
+          "status": "GRANTED",
+          "consented": true,
+          "provider": "did:key:zDevProvider",
+          "consumer": "did:key:zDevConsumer",
+          "purposes": ["Dev profile processing"],
+          "data": ["Profile records"],
+          "contractUri": "http://mock:8080/contracts/dev-contract"
         }
-      ]
+      ],
+      "page": 0,
+      "size": 50,
+      "totalElements": 1,
+      "totalPages": 1
     }
   }
 }
