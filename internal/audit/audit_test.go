@@ -94,6 +94,34 @@ func TestEmitExportsOTLPLog(t *testing.T) {
 	assert.Equal(t, "req-1", attrs["http.request.id"])
 }
 
+// TestConsentIDAttribute verifies an allow carries the matched consent id and a
+// record without one omits the attribute rather than exporting an empty value.
+func TestConsentIDAttribute(t *testing.T) {
+	tests := []struct {
+		name      string
+		consentID string
+		wantFound bool
+	}{
+		{name: "matched consent", consentID: "3f1e2d4c-5b6a-4789-8abc-def012345678", wantFound: true},
+		{name: "no consent", consentID: "", wantFound: false},
+	}
+	e := newEmitter(Config{Endpoint: "http://127.0.0.1:0"})
+	defer e.Shutdown()
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := e.buildPayload([]Event{{Decision: "allow", ConsentID: tt.consentID}})
+			value, found := "", false
+			for _, a := range p.ResourceLogs[0].ScopeLogs[0].LogRecords[0].Attributes {
+				if a.Key == consentIDAttribute {
+					value, found = a.Value.StringValue, true
+				}
+			}
+			assert.Equal(t, tt.wantFound, found)
+			assert.Equal(t, tt.consentID, value)
+		})
+	}
+}
+
 // TestEndpointNormalization verifies the base endpoint gets /v1/logs appended and
 // an endpoint already ending in /v1/logs is left untouched.
 func TestEndpointNormalization(t *testing.T) {
