@@ -199,6 +199,10 @@ const (
 	itestNoticeID = "3f2a6c1e-0b7d-4c8e-9a51-2d4e6f708192"
 	// itestCaller is the token's sub, which must never be taken as the data owner.
 	itestCaller = "did:key:zCaller"
+	// itestPurpose is the route-level purpose a consent must list to be matched.
+	itestPurpose = "Provide the trip history to the consumer"
+	// itestOtherPurpose is a purpose the route never asks for.
+	itestOtherPurpose = "Marketing"
 )
 
 // Wire values of the fake.
@@ -256,6 +260,11 @@ func toConsumer(did string) consentOption { return func(c *dscConsent) { c.consu
 
 // fromProvider names did as the consent's provider.
 func fromProvider(did string) consentOption { return func(c *dscConsent) { c.provider = did } }
+
+// withPurposes sets the purposes the consent was given for.
+func withPurposes(purposes ...string) consentOption {
+	return func(c *dscConsent) { c.purposes = purposes }
+}
 
 // dscConsentManager is a stateful fake of dsc-consent-manager /v1 whose consent
 // set tests mutate between plugin cycles. Every request it serves is checked
@@ -389,7 +398,7 @@ func (m *dscConsentManager) serveMe(w http.ResponseWriter, _ *http.Request) {
 func (m *dscConsentManager) serveToken(w http.ResponseWriter, r *http.Request) {
 	var b map[string]string
 	_ = json.NewDecoder(r.Body).Decode(&b)
-	assert.Equal(m.t, "consent-manager", b["audience"])
+	assert.Equal(m.t, plugin.DefaultTokenAudience, b["audience"])
 	writeJSON(w, map[string]interface{}{"access_token": itestFetchedToken, "token_type": "Bearer", "expires_in": 3600})
 }
 
@@ -676,16 +685,19 @@ func TestIntegration_ConsentLifecycle(t *testing.T) {
 }
 
 // TestIntegration_ConsentScoping verifies a consent of the right owner still
-// denies when it binds another consumer or another provider, in each mode. In
-// check mode the route-level notice id makes /consents/check answer valid, so
-// only the mandatory consent read can catch the mismatch.
+// denies when it binds another consumer or another provider, or lacks the route
+// purpose, in each mode. In check mode the route-level notice id makes
+// /consents/check answer valid for the scoping cases, so only the mandatory
+// consent read can catch the mismatch.
 func TestIntegration_ConsentScoping(t *testing.T) {
 	const owner = "did:key:zAlice"
+	routePurpose := map[string]interface{}{"purpose": itestPurpose}
 
 	tests := []struct {
 		name       string
 		grant      []consentOption
 		consumer   string
+		config     map[string]interface{}
 		wantDenied bool
 	}{
 		{name: "consent to this consumer allows", consumer: itestConsumerDID},
@@ -703,6 +715,19 @@ func TestIntegration_ConsentScoping(t *testing.T) {
 			consumer:   itestProviderDID,
 			wantDenied: true,
 		},
+		{
+			name:     "consent listing the route purpose allows",
+			grant:    []consentOption{withPurposes(itestOtherPurpose, itestPurpose)},
+			consumer: itestConsumerDID,
+			config:   routePurpose,
+		},
+		{
+			name:       "consent lacking the route purpose denies",
+			grant:      []consentOption{withPurposes(itestOtherPurpose)},
+			consumer:   itestConsumerDID,
+			config:     routePurpose,
+			wantDenied: true,
+		},
 	}
 
 	for _, mode := range checkModes {
@@ -713,7 +738,7 @@ func TestIntegration_ConsentScoping(t *testing.T) {
 				cm.grant(owner, tt.grant...)
 				resolver := newOwnerResolver(t, owner)
 
-				resp := runPluginCycle(t, marshalConfig(t, baseConfig(cm.URL, resolver.URL, mode.config)),
+				resp := runPluginCycle(t, marshalConfig(t, baseConfig(cm.URL, resolver.URL, mode.config, tt.config)),
 					consentRequestFrom(tt.consumer), []byte(`{"email":"alice@example.org"}`))
 
 				if tt.wantDenied {
