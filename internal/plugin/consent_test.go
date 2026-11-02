@@ -320,7 +320,6 @@ func newTestConfig(consentAPIURL, resolverURL string) *Config {
 		MaxResolveBodyBytes:     DefaultMaxResolveBodyBytes,
 		ConsumerClaim:           DefaultConsumerClaim,
 		JWTHeaderName:           DefaultJWTHeaderName,
-		ConsentKey:              "test-consent-key",
 		ParticipantToken:        "test-participant-token",
 		ProviderSD:              "http://consent-facade:8080/participants/org-1",
 		DenyStatusCode:          DefaultDenyStatusCode,

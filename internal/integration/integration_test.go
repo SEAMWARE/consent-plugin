@@ -184,8 +184,6 @@ func newConsentManager(t *testing.T, wantSubject, userID string, statuses []stri
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/v1/users/identifier/search", func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, "itest-consent-key", r.Header.Get("x-visionstrust-consent-key"),
-			"identifier search must carry the consent key")
 		var body map[string]string
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Errorf("failed to decode identifier search body: %v", err)
@@ -323,7 +321,6 @@ func baseConfig(consentURL, resolverURL string) map[string]interface{} {
 	return map[string]interface{}{
 		"consent_api_url":    consentURL,
 		"owner_resolver_url": resolverURL,
-		"consent_key":        "itest-consent-key",
 		"participant_token":  "itest-participant-token",
 		"provider_sd":        "http://consent-facade:8080/participants/org-itest",
 	}
@@ -582,7 +579,6 @@ func newConsentManagerTokenService(t *testing.T, wantSubject, userID, selfDescri
 	})
 
 	mux.HandleFunc("/v1/users/identifier/search", func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, "itest-consent-key", r.Header.Get("x-visionstrust-consent-key"))
 		var b map[string]string
 		_ = json.NewDecoder(r.Body).Decode(&b)
 		if wantSubject != "" {
@@ -614,7 +610,6 @@ func tokenServiceConfig(consentURL, resolverURL string) map[string]interface{} {
 	return map[string]interface{}{
 		"consent_api_url":    consentURL,
 		"owner_resolver_url": resolverURL,
-		"consent_key":        "itest-consent-key",
 		"token_service_url":  consentURL + "/internal/tokens",
 	}
 }

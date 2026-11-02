@@ -598,9 +598,7 @@ func reduceOwnerResults(cfg *Config, key string, reqCtx *RequestContext, phaseEr
 func clientConfigFromCfg(cfg *Config) consent.ClientConfig {
 	return consent.ClientConfig{
 		BaseURL:          cfg.ConsentAPIURL,
-		Host:             cfg.ConsentAPIHost,
 		APIPrefix:        cfg.ConsentAPIPrefix,
-		ConsentKey:       cfg.ConsentKey,
 		ProviderSD:       cfg.ProviderSD,
 		ParticipantToken: cfg.ParticipantToken,
 		TokenServiceURL:  cfg.TokenServiceURL,
