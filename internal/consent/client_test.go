@@ -20,9 +20,12 @@ package consent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -40,6 +43,15 @@ const testAudience = "consent-manager"
 // testConsumerSD is the self-description URL of the participant the data is
 // released to — the consumer every check is scoped to.
 const testConsumerSD = "http://catalog/participants/consumer"
+
+// testProviderDID is the identifier /participants/me reports for this participant.
+const testProviderDID = "did:key:zProvider"
+
+// writeMe answers /participants/me with this participant's identifier and sd.
+func writeMe(w http.ResponseWriter, sd string) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"identifier": testProviderDID, "selfDescriptionUri": sd})
+}
 
 // mockCM is a configurable mock covering the four endpoints the client uses: the
 // participant-local token service (/internal/tokens, served here for convenience
@@ -95,8 +107,7 @@ func newMockCM(t *testing.T, m *mockCM) *httptest.Server {
 		m.meCalls++
 		sd := m.selfDescriptionURL
 		m.mu.Unlock()
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{"selfDescriptionURL": sd})
+		writeMe(w, sd)
 	})
 
 	mux.HandleFunc("/v1/users/identifier/search", func(w http.ResponseWriter, r *http.Request) {
@@ -275,11 +286,12 @@ func TestCheckConsent(t *testing.T) {
 			m.mu.Lock()
 			defer m.mu.Unlock()
 			assert.Equal(t, 0, m.tokenCalls, "static token must not call the token service")
-			assert.Equal(t, 0, m.meCalls, "static SD must not trigger /me")
 			if tt.requestConsumer == "none" {
+				assert.Equal(t, 0, m.meCalls, "a check without a consumer must not reach the consent-manager")
 				assert.Equal(t, 0, m.searchCalls, "a check without a consumer must not reach the consent-manager")
 				return
 			}
+			assert.Equal(t, 1, m.meCalls, "static SD still needs /me for this participant's identifier")
 			assert.Equal(t, provSD, m.lastSearchSD)
 			assert.Equal(t, subject, m.lastSearchEmail)
 			if tt.userID != "" {
@@ -404,8 +416,8 @@ func TestCheckConsent_TokenServiceFailure(t *testing.T) {
 	assert.Contains(t, err.Error(), "token service returned status 404")
 }
 
-// TestCheckConsent_ProviderSDOverride verifies an explicit provider_sd skips /me
-// while still using client credentials for the token.
+// TestCheckConsent_ProviderSDOverride verifies an explicit provider_sd wins over
+// the SD from /me, which is still called for this participant's identifier.
 func TestCheckConsent_ProviderSDOverride(t *testing.T) {
 	resetCredCache()
 	m := &mockCM{userID: "uid-1", statuses: []string{"granted"}}
@@ -419,7 +431,7 @@ func TestCheckConsent_ProviderSDOverride(t *testing.T) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	assert.Equal(t, 1, m.tokenCalls, "token still comes from the token service")
-	assert.Equal(t, 0, m.meCalls, "explicit provider_sd skips /me")
+	assert.Equal(t, 1, m.meCalls, "/me is called for the identifier even with provider_sd")
 	assert.Equal(t, "http://facade/explicit", m.lastSearchSD)
 }
 
@@ -567,6 +579,7 @@ func TestCheckConsent_SeparateTokenServicesDoNotShareToken(t *testing.T) {
 	var consentsAuth []string
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/participants/me", func(w http.ResponseWriter, _ *http.Request) { writeMe(w, "") })
 	mux.HandleFunc("/v1/users/identifier/search", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]string{"userIdentifier": "uid-1"})
@@ -617,121 +630,316 @@ func TestCheckConsent_SeparateTokenServicesDoNotShareToken(t *testing.T) {
 
 // --- Participant registry lookup (the contract-side party mapping) ---
 
-// newParticipantRegistry starts a mock consent-manager participant registry that
-// counts its calls and can 401 the first one.
-func newParticipantRegistry(t *testing.T, entries []map[string]string, calls *int, fail401First *bool) *httptest.Server {
+// registryParticipant is one participant record the mock registry holds.
+type registryParticipant struct {
+	Identifier         string `json:"identifier"`
+	SelfDescriptionURI string `json:"selfDescriptionUri,omitempty"`
+	DeregisteredAt     string `json:"deregisteredAt,omitempty"`
+}
+
+// participantRegistry is a mock dsc-consent-manager participant registry plus
+// /participants/me. status, when set, is returned instead of a page.
+type participantRegistry struct {
+	mu           sync.Mutex
+	entries      []registryParticipant
+	status       int
+	body         string
+	fail401First bool
+	calls        int
+	lastQuery    string
+}
+
+func (r *participantRegistry) set(entries []registryParticipant) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.entries = entries
+}
+
+func (r *participantRegistry) callCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls
+}
+
+// newParticipantRegistry serves r on /v1/participants (filtered by identifier,
+// like the real registry) and /v1/participants/me.
+func newParticipantRegistry(t *testing.T, r *participantRegistry) *httptest.Server {
 	t.Helper()
-	var mu sync.Mutex
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		mu.Lock()
-		*calls++
-		n := *calls
-		mu.Unlock()
-		if fail401First != nil && *fail401First && n == 1 {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/participants/me", func(w http.ResponseWriter, _ *http.Request) { writeMe(w, "") })
+	mux.HandleFunc("/v1/participants", func(w http.ResponseWriter, req *http.Request) {
+		r.mu.Lock()
+		r.calls++
+		n := r.calls
+		r.lastQuery = req.URL.RawQuery
+		status, body, entries := r.status, r.body, append([]registryParticipant(nil), r.entries...)
+		fail := r.fail401First
+		r.mu.Unlock()
+		if fail && n == 1 {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
+		if status != 0 {
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(body))
+			return
+		}
+		if body != "" {
+			_, _ = w.Write([]byte(body))
+			return
+		}
+		content := []registryParticipant{}
+		for _, e := range entries {
+			if e.Identifier == req.URL.Query().Get("identifier") {
+				content = append(content, e)
+			}
+		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(entries)
-	}))
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"content": content, "totalElements": len(content)})
+	})
+	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return srv
 }
 
-// TestParticipantSelfDescriptionByDID_401RefreshRetry verifies a rejected cached
-// token is refreshed and the registry lookup retried, rather than failing
-// terminally — a stale token must not take the whole exchange down.
-func TestParticipantSelfDescriptionByDID_401RefreshRetry(t *testing.T) {
-	resetCredCache()
-
-	var registryCalls int
-	fail := true
-	registry := newParticipantRegistry(t,
-		[]map[string]string{{"did": "did:key:zConsumer", "selfDescriptionURL": testConsumerSD}},
-		&registryCalls, &fail)
-
-	tokenSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+// newStaticTokenService serves a token service that always mints "tok".
+func newStaticTokenService(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"access_token": "tok", "token_type": "Bearer", "expires_in": 3600,
 		})
 	}))
-	t.Cleanup(tokenSrv.Close)
-
-	c := NewClient(ClientConfig{
-		BaseURL: registry.URL, APIPrefix: "", ProviderSD: "sd",
-		TokenServiceURL: tokenSrv.URL, TokenAudience: testAudience,
-	})
-
-	sd, err := c.ParticipantSelfDescriptionByDID(context.Background(), "did:key:zConsumer")
-	require.NoError(t, err)
-	assert.Equal(t, testConsumerSD, sd)
-	assert.Equal(t, 2, registryCalls, "the 401 must trigger one refresh and retry")
+	t.Cleanup(srv.Close)
+	return srv
 }
 
-// TestParticipantSelfDescriptionByDID_NegativeCaching verifies an unknown DID is
-// remembered as unknown, so a misconfiguration does not re-fetch the whole
-// participant list on every request.
-func TestParticipantSelfDescriptionByDID_NegativeCaching(t *testing.T) {
-	resetCredCache()
+// TestParticipantSelfDescriptionByDID covers the registry answers: a usable
+// participant maps to its SD URI, every final negative is ErrParticipantNotRegistered,
+// and statuses are classified by statusError.
+func TestParticipantSelfDescriptionByDID(t *testing.T) {
+	const did = "did:key:zConsumer"
 
-	var registryCalls int
-	registry := newParticipantRegistry(t, []map[string]string{}, &registryCalls, nil)
-
-	c := NewClient(ClientConfig{
-		BaseURL: registry.URL, APIPrefix: "", ParticipantToken: "static", ProviderSD: "sd",
-	})
-
-	for i := 0; i < 3; i++ {
-		_, err := c.ParticipantSelfDescriptionByDID(context.Background(), "did:key:zUnregistered")
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "no participant registered")
-	}
-	assert.Equal(t, 1, registryCalls, "an unknown DID must be remembered, not re-fetched per request")
-}
-
-// TestDecodeParticipants verifies both registry shapes are accepted: the
-// consent-manager has returned a bare array and a wrapped list at different
-// times, and a plugin that understands only one silently loses the ability to
-// identify the consumer.
-func TestDecodeParticipants(t *testing.T) {
 	tests := []struct {
-		name    string
-		body    string
-		want    []participantListEntry
-		wantErr bool
+		name         string
+		registry     *participantRegistry
+		wantSD       string
+		wantSentinel error
+		wantErr      string
+		wantCalls    int
 	}{
 		{
-			name: "bare array",
-			body: `[{"did":"did:key:zA","selfDescriptionURL":"http://catalog/a"}]`,
-			want: []participantListEntry{{DID: "did:key:zA", SelfDescriptionURL: "http://catalog/a"}},
+			name:      "found",
+			registry:  &participantRegistry{entries: []registryParticipant{{Identifier: did, SelfDescriptionURI: testConsumerSD}}},
+			wantSD:    testConsumerSD,
+			wantCalls: 1,
 		},
 		{
-			name: "wrapped list",
-			body: `{"participants":[{"did":"did:key:zB","selfDescriptionURL":"http://catalog/b"}]}`,
-			want: []participantListEntry{{DID: "did:key:zB", SelfDescriptionURL: "http://catalog/b"}},
+			name: "first entry with the exact identifier wins",
+			registry: &participantRegistry{body: `{"content":[{"identifier":"did:key:zOther","selfDescriptionUri":"http://catalog/other"},` +
+				`{"identifier":"` + did + `","selfDescriptionUri":"` + testConsumerSD + `"}]}`},
+			wantSD:    testConsumerSD,
+			wantCalls: 1,
 		},
 		{
-			name: "empty array",
-			body: `[]`,
-			want: []participantListEntry{},
+			name:         "not found",
+			registry:     &participantRegistry{},
+			wantSentinel: ErrParticipantNotRegistered,
+			wantErr:      reasonNotRegistered,
+			wantCalls:    1,
 		},
 		{
-			name:    "not JSON at all",
-			body:    `<html>gateway error</html>`,
-			wantErr: true,
+			name:         "missing SD URI",
+			registry:     &participantRegistry{entries: []registryParticipant{{Identifier: did}}},
+			wantSentinel: ErrParticipantNotRegistered,
+			wantErr:      reasonNoSelfDescription,
+			wantCalls:    1,
+		},
+		{
+			name: "deregistered keeps its SD URI but is not registered",
+			registry: &participantRegistry{entries: []registryParticipant{
+				{Identifier: did, SelfDescriptionURI: testConsumerSD, DeregisteredAt: "2026-10-01T12:00:00Z"},
+			}},
+			wantSentinel: ErrParticipantNotRegistered,
+			wantErr:      reasonDeregistered,
+			wantCalls:    1,
+		},
+		{
+			name: "401 refreshes the token and retries once",
+			registry: &participantRegistry{
+				entries:      []registryParticipant{{Identifier: did, SelfDescriptionURI: testConsumerSD}},
+				fail401First: true,
+			},
+			wantSD:    testConsumerSD,
+			wantCalls: 2,
+		},
+		{
+			name:         "401 after the refresh is an auth error",
+			registry:     &participantRegistry{status: http.StatusUnauthorized},
+			wantSentinel: ErrConsentManagerAuth,
+			wantCalls:    2,
+		},
+		{
+			name:         "403 is an auth error",
+			registry:     &participantRegistry{status: http.StatusForbidden},
+			wantSentinel: ErrConsentManagerAuth,
+			wantErr:      "may be deregistered",
+			wantCalls:    1,
+		},
+		{
+			name:         "404 from a wrong prefix is rejected",
+			registry:     &participantRegistry{status: http.StatusNotFound},
+			wantSentinel: ErrConsentManagerRejected,
+			wantCalls:    1,
+		},
+		{
+			name:      "429 is retryable",
+			registry:  &participantRegistry{status: http.StatusTooManyRequests},
+			wantErr:   "participants lookup returned status 429",
+			wantCalls: 1,
+		},
+		{
+			name:      "5xx is retryable and keeps the body out",
+			registry:  &participantRegistry{status: http.StatusBadGateway, body: `{"error":"boom for alice@example.org"}`},
+			wantErr:   "participants lookup returned status 502",
+			wantCalls: 1,
+		},
+		{
+			name:      "malformed JSON",
+			registry:  &participantRegistry{body: `<html>gateway error</html>`},
+			wantErr:   "failed to unmarshal participants response",
+			wantCalls: 1,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := decodeParticipants([]byte(tt.body))
-			if tt.wantErr {
-				require.Error(t, err)
+			resetCredCache()
+			registry := tt.registry
+			srv := newParticipantRegistry(t, registry)
+			c := NewClient(ClientConfig{
+				BaseURL: srv.URL, ProviderSD: "sd",
+				TokenServiceURL: newStaticTokenService(t).URL, TokenAudience: testAudience,
+			})
+
+			sd, err := c.ParticipantSelfDescriptionByDID(context.Background(), did)
+			assert.Equal(t, tt.wantCalls, registry.callCount())
+			if tt.wantSentinel == nil && tt.wantErr == "" {
+				require.NoError(t, err)
+				assert.Equal(t, tt.wantSD, sd)
+				assert.Equal(t, "identifier="+url.QueryEscape(did), registry.lastQuery)
 				return
 			}
-			require.NoError(t, err)
-			assert.Equal(t, tt.want, got)
+			require.Error(t, err)
+			if tt.wantSentinel != nil {
+				assert.ErrorIs(t, err, tt.wantSentinel)
+			} else {
+				for _, final := range []error{ErrParticipantNotRegistered, ErrConsentManagerAuth, ErrConsentManagerRejected} {
+					assert.NotErrorIs(t, err, final, "a retryable failure must stay subject to fail_open")
+				}
+			}
+			assert.Contains(t, err.Error(), tt.wantErr)
+			assert.NotContains(t, err.Error(), did, "the DID is fingerprinted, never embedded")
+			assert.NotContains(t, err.Error(), "alice@example.org", "a dependency body must not travel in the error")
+		})
+	}
+}
+
+// TestParticipantSelfDescriptionByDID_NegativeCaching verifies every negative
+// answer is remembered, so a misconfigured or departed DID does not query the
+// registry on every request.
+func TestParticipantSelfDescriptionByDID_NegativeCaching(t *testing.T) {
+	const did = "did:key:zConsumer"
+	tests := []struct {
+		name    string
+		entries []registryParticipant
+		reason  string
+	}{
+		{"unknown", nil, reasonNotRegistered},
+		{"deregistered", []registryParticipant{{Identifier: did, SelfDescriptionURI: testConsumerSD, DeregisteredAt: "2026-10-01T12:00:00Z"}}, reasonDeregistered},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resetCredCache()
+			registry := &participantRegistry{entries: tt.entries}
+			srv := newParticipantRegistry(t, registry)
+			c := NewClient(ClientConfig{BaseURL: srv.URL, ParticipantToken: "static", ProviderSD: "sd"})
+
+			for i := 0; i < 3; i++ {
+				_, err := c.ParticipantSelfDescriptionByDID(context.Background(), did)
+				require.ErrorIs(t, err, ErrParticipantNotRegistered)
+				assert.Contains(t, err.Error(), tt.reason)
+			}
+			assert.Equal(t, 1, registry.callCount(), "a negative answer must be remembered, not re-fetched per request")
+		})
+	}
+}
+
+// TestParticipantSelfDescriptionByDID_DeregisteredAfterCaching pins the accepted
+// window: a DID cached as registered keeps passing until its positive entry
+// expires, and is then denied as deregistered.
+func TestParticipantSelfDescriptionByDID_DeregisteredAfterCaching(t *testing.T) {
+	const did = "did:key:zConsumer"
+	resetCredCache()
+	registry := &participantRegistry{entries: []registryParticipant{{Identifier: did, SelfDescriptionURI: testConsumerSD}}}
+	srv := newParticipantRegistry(t, registry)
+	c := NewClient(ClientConfig{BaseURL: srv.URL, ParticipantToken: "static", ProviderSD: "sd"})
+
+	sd, err := c.ParticipantSelfDescriptionByDID(context.Background(), did)
+	require.NoError(t, err)
+	require.Equal(t, testConsumerSD, sd)
+
+	registry.set([]registryParticipant{{Identifier: did, SelfDescriptionURI: testConsumerSD, DeregisteredAt: "2026-10-01T12:00:00Z"}})
+
+	sd, err = c.ParticipantSelfDescriptionByDID(context.Background(), did)
+	require.NoError(t, err, "the positive entry still holds before participantSDCacheTTL")
+	assert.Equal(t, testConsumerSD, sd)
+	assert.Equal(t, 1, registry.callCount())
+
+	key := c.cacheKey() + credentialKeySeparator + did
+	participantSDMu.Lock()
+	entry := participantSDCache[key]
+	entry.expiry = time.Now().Add(-time.Second)
+	participantSDCache[key] = entry
+	participantSDMu.Unlock()
+
+	_, err = c.ParticipantSelfDescriptionByDID(context.Background(), did)
+	require.ErrorIs(t, err, ErrParticipantNotRegistered)
+	assert.Contains(t, err.Error(), reasonDeregistered)
+	assert.Equal(t, 2, registry.callCount())
+}
+
+// TestStatusError pins the status classification shared by every consent-manager call.
+func TestStatusError(t *testing.T) {
+	tests := []struct {
+		status       int
+		wantSentinel error
+	}{
+		{http.StatusBadRequest, ErrConsentManagerRejected},
+		{http.StatusUnauthorized, ErrConsentManagerAuth},
+		{http.StatusForbidden, ErrConsentManagerAuth},
+		{http.StatusNotFound, ErrConsentManagerRejected},
+		{http.StatusMethodNotAllowed, ErrConsentManagerRejected},
+		{http.StatusUnprocessableEntity, ErrConsentManagerRejected},
+		{http.StatusTooManyRequests, nil},
+		{http.StatusInternalServerError, nil},
+		{http.StatusServiceUnavailable, nil},
+	}
+	for _, tt := range tests {
+		t.Run(strconv.Itoa(tt.status), func(t *testing.T) {
+			err := statusError("op", tt.status, []byte(`{"secret":"alice@example.org"}`))
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "op returned status "+strconv.Itoa(tt.status))
+			assert.NotContains(t, err.Error(), "alice@example.org")
+			assert.Equal(t, tt.status == http.StatusUnauthorized, errors.Is(err, errParticipantUnauthorized),
+				"only a 401 is worth a token refresh")
+			if tt.wantSentinel != nil {
+				assert.ErrorIs(t, err, tt.wantSentinel)
+				return
+			}
+			assert.NotErrorIs(t, err, ErrConsentManagerAuth)
+			assert.NotErrorIs(t, err, ErrConsentManagerRejected)
 		})
 	}
 }
@@ -849,24 +1057,37 @@ func TestCheckConsent_PurposeScoped(t *testing.T) {
 	}
 }
 
-// TestFetchProviderSD_Failures covers the derivation of the provider
-// self-description from /participants/me. It runs before any consent check, so
-// a failure here takes the whole exchange down (fail-closed) — the branches are
-// worth pinning.
-func TestFetchProviderSD_Failures(t *testing.T) {
+// TestFetchSelf_Failures covers GET /participants/me. It runs before any
+// consent check, so a failure here takes the whole exchange down — the branches,
+// and which of them fail_open may never release on, are worth pinning.
+func TestFetchSelf_Failures(t *testing.T) {
 	tests := []struct {
-		name       string
-		status     int
-		body       string
-		wantErr    string
-		wantNoBody bool
+		name         string
+		status       int
+		body         string
+		wantErr      string
+		wantSentinel error
 	}{
 		{
-			name:   "a 401 is reported as unauthorized so the caller can refresh",
-			status: http.StatusUnauthorized,
-			body:   `{}`,
-			// CheckConsent maps the retried-and-still-401 case to this message.
-			wantErr: "participant token rejected (401)",
+			name:         "a 401 after one refresh is an auth error",
+			status:       http.StatusUnauthorized,
+			body:         `{}`,
+			wantErr:      "participant lookup (/me) returned status 401",
+			wantSentinel: ErrConsentManagerAuth,
+		},
+		{
+			name:         "a 403 is an auth error",
+			status:       http.StatusForbidden,
+			body:         `{}`,
+			wantErr:      "may be deregistered",
+			wantSentinel: ErrConsentManagerAuth,
+		},
+		{
+			name:         "a 404 from a wrong prefix is rejected",
+			status:       http.StatusNotFound,
+			body:         `{}`,
+			wantErr:      "participant lookup (/me) returned status 404",
+			wantSentinel: ErrConsentManagerRejected,
 		},
 		{
 			name:    "a 500 is classified without its body",
@@ -881,10 +1102,17 @@ func TestFetchProviderSD_Failures(t *testing.T) {
 			wantErr: "failed to unmarshal /me response",
 		},
 		{
-			name:    "an empty selfDescriptionURL errors",
+			name:         "a missing identifier is rejected",
+			status:       http.StatusOK,
+			body:         `{"selfDescriptionUri":"http://facade/sd"}`,
+			wantErr:      "/me returned no identifier",
+			wantSentinel: ErrConsentManagerRejected,
+		},
+		{
+			name:    "an empty selfDescriptionUri errors without a configured provider_sd",
 			status:  http.StatusOK,
-			body:    `{"selfDescriptionURL":""}`,
-			wantErr: "/me returned no selfDescriptionURL",
+			body:    `{"identifier":"did:key:zProvider","selfDescriptionUri":""}`,
+			wantErr: "/me returned no selfDescriptionUri",
 		},
 	}
 
@@ -898,28 +1126,68 @@ func TestFetchProviderSD_Failures(t *testing.T) {
 				w.WriteHeader(tt.status)
 				_, _ = w.Write([]byte(tt.body))
 			})
-			mux.HandleFunc(tokenServicePath, func(w http.ResponseWriter, _ *http.Request) {
-				w.Header().Set("Content-Type", "application/json")
-				_ = json.NewEncoder(w).Encode(map[string]interface{}{
-					"access_token": "tok", "token_type": "Bearer", "expires_in": 3600,
-				})
-			})
 			srv := httptest.NewServer(mux)
 			t.Cleanup(srv.Close)
 
-			c := NewClient(ClientConfig{BaseURL: srv.URL, TokenServiceURL: srv.URL + tokenServicePath, TokenAudience: testAudience})
+			c := NewClient(ClientConfig{BaseURL: srv.URL, TokenServiceURL: newStaticTokenService(t).URL, TokenAudience: testAudience})
 
-			_, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: "did:key:z", Consumer: testConsumerSD})
+			_, err := c.ProviderSelfDescription(context.Background())
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), tt.wantErr)
+			if tt.wantSentinel != nil {
+				assert.ErrorIs(t, err, tt.wantSentinel)
+			}
 			assert.NotContains(t, err.Error(), "alice@example.org",
 				"a dependency response body must not travel in the error")
 		})
 	}
 }
 
+// TestCredentials_SelfIdentifier verifies credentials carries this participant's
+// identifier from /me in every configuration, including a fully static one.
+func TestCredentials_SelfIdentifier(t *testing.T) {
+	tests := []struct {
+		name   string
+		cfg    func(srvURL string) ClientConfig
+		wantSD string
+	}{
+		{
+			name: "token service, SD from /me",
+			cfg: func(u string) ClientConfig {
+				return ClientConfig{BaseURL: u, TokenServiceURL: u + tokenServicePath, TokenAudience: testAudience}
+			},
+			wantSD: "http://facade/derived",
+		},
+		{
+			name: "static token and provider_sd",
+			cfg: func(u string) ClientConfig {
+				return ClientConfig{BaseURL: u, ParticipantToken: "static", ProviderSD: "http://facade/explicit"}
+			},
+			wantSD: "http://facade/explicit",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resetCredCache()
+			m := &mockCM{selfDescriptionURL: "http://facade/derived"}
+			srv := newMockCM(t, m)
+			c := NewClient(tt.cfg(srv.URL))
+
+			for i := 0; i < 2; i++ {
+				creds, err := c.credentials(context.Background(), false)
+				require.NoError(t, err)
+				assert.Equal(t, testProviderDID, creds.self)
+				assert.Equal(t, tt.wantSD, creds.providerSD)
+			}
+			m.mu.Lock()
+			defer m.mu.Unlock()
+			assert.Equal(t, 1, m.meCalls, "/me is called once and cached with the token")
+		})
+	}
+}
+
 // TestProviderSelfDescription_StaticOverride verifies a configured provider SD
-// is returned without any HTTP call at all.
+// wins, and that a static token skips the token service but not /me.
 func TestProviderSelfDescription_StaticOverride(t *testing.T) {
 	resetCredCache()
 	m := &mockCM{userID: "uid-1", statuses: []string{"granted"}}
@@ -932,6 +1200,6 @@ func TestProviderSelfDescription_StaticOverride(t *testing.T) {
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	assert.Equal(t, 0, m.meCalls, "a static provider SD must not trigger /me")
+	assert.Equal(t, 1, m.meCalls, "/me is still called for this participant's identifier")
 	assert.Equal(t, 0, m.tokenCalls, "a static token must not trigger the token service")
 }

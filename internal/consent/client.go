@@ -48,13 +48,15 @@ const (
 	// the participant. Authenticated with the participant JWT. %s = identifier.
 	participantConsentsPathFmt = "/consents/participants/%s"
 
-	// participantMePath returns the calling participant (incl. selfDescriptionURL).
+	// participantMePath returns the calling participant (identifier and selfDescriptionUri).
 	participantMePath = "/participants/me"
 
-	// participantsPath lists the known participants (the consent-manager is the
-	// participant registry), used to map a participant DID to its
-	// self-description URL.
+	// participantsPath is the participant registry, used to map a participant
+	// DID to its self-description URI.
 	participantsPath = "/participants"
+
+	// identifierQueryParam filters the participant registry by DID.
+	identifierQueryParam = "identifier"
 
 	// grantedStatus is the consent status that authorizes access.
 	grantedStatus = "granted"
@@ -78,9 +80,20 @@ const (
 	ContentTypeJSON = "application/json"
 )
 
+// ErrConsentManagerAuth signals that the consent-manager refused the participant
+// credentials: a 401 that survived one token refresh, or a 403 (the caller may be
+// deregistered). Retrying will not fix it, so callers must always fail closed.
+var ErrConsentManagerAuth = errors.New("consent client: consent-manager refused the participant credentials")
+
+// ErrConsentManagerRejected signals a permanent 4xx (other than 401, 403 and 429)
+// or an unusable answer, e.g. a wrong consent_api_prefix. It is a
+// misconfiguration, so callers must always fail closed rather than fail open.
+var ErrConsentManagerRejected = errors.New("consent client: consent-manager rejected the request")
+
 // errParticipantUnauthorized signals that the participant token was rejected
-// (HTTP 401), so a cached token should be refreshed and the call retried.
-var errParticipantUnauthorized = errors.New("consent client: participant token unauthorized")
+// (HTTP 401), so a cached token should be refreshed and the call retried. It
+// wraps ErrConsentManagerAuth, so a 401 that survives the retry is already final.
+var errParticipantUnauthorized = fmt.Errorf("%w: participant token unauthorized", ErrConsentManagerAuth)
 
 // ErrNoCredentials signals that the client has no way to authenticate as the
 // participant at all. It is a misconfiguration, not an availability failure:
@@ -131,9 +144,9 @@ type ClientConfig struct {
 // (POST {TokenServiceURL} with the configured audience), so this plugin holds no
 // participant credentials of its own: the token service presents the
 // participant's verifiable credential and returns a short-lived token. GET
-// /participants/me then yields the provider selfDescriptionURL. Tokens are cached
-// package-wide (keyed by the full credential identity, see cacheKey) and
-// refreshed on expiry or a 401. Access is allowed iff a returned consent is
+// /participants/me then yields this participant's own identifier and its
+// selfDescriptionUri. Tokens are cached package-wide (keyed by the full
+// credential identity, see cacheKey) and refreshed on expiry or a 401. Access is allowed iff a returned consent is
 // "granted" AND was granted to the consuming participant named in the request
 // (see hasGrantedConsent).
 type Client struct {
@@ -185,6 +198,17 @@ type cacheEntry struct {
 	token       string
 	tokenExpiry time.Time
 	providerSD  string
+	// self is this participant's identifier from /participants/me; "" until fetched.
+	self string
+}
+
+// participantCredentials is what the client authenticates and identifies itself with.
+type participantCredentials struct {
+	token      string
+	providerSD string
+	// self is this participant's own identifier (DID): the provider a consent
+	// must name before it can authorise a release by this participant.
+	self string
 }
 
 var (
@@ -248,12 +272,9 @@ func (c *Client) CheckConsent(ctx context.Context, req ConsentRequest) (*Consent
 
 	resp, err := c.check(ctx, req, false)
 	if errors.Is(err, errParticipantUnauthorized) && c.staticToken == "" {
-		// The cached token was rejected — refresh it and retry once.
+		// The cached token was rejected — refresh it and retry once. A second 401
+		// is returned as is: it already wraps ErrConsentManagerAuth.
 		resp, err = c.check(ctx, req, true)
-	}
-	if errors.Is(err, errParticipantUnauthorized) {
-		// Still unauthorized (or a static token was rejected): surface a plain error.
-		return nil, fmt.Errorf("consent client: participant token rejected (401)")
 	}
 	return resp, err
 }
@@ -263,12 +284,13 @@ func (c *Client) CheckConsent(ctx context.Context, req ConsentRequest) (*Consent
 // it was granted to req.Consumer and, when set, covers req.DataResource and
 // req.Purpose.
 func (c *Client) check(ctx context.Context, req ConsentRequest, forceLogin bool) (*ConsentResponse, error) {
-	token, providerSD, err := c.credentials(ctx, forceLogin)
+	creds, err := c.credentials(ctx, forceLogin)
 	if err != nil {
 		return nil, err
 	}
+	token := creds.token
 
-	userIdentifier, found, err := c.resolveUserIdentifier(ctx, req.Subject, providerSD, token)
+	userIdentifier, found, err := c.resolveUserIdentifier(ctx, req.Subject, creds.providerSD, token)
 	if err != nil {
 		return nil, err
 	}
@@ -300,21 +322,20 @@ func noGrantedConsentReason(req ConsentRequest) string {
 	return reason
 }
 
-// credentials resolves the participant token and provider self-description,
-// preferring static configuration and otherwise using the client-credentials
-// the token service (cached) and GET /participants/me. forceFetch bypasses a cached token.
+// credentials resolves the participant token, the provider self-description and
+// this participant's own identifier. The token is static or fetched from the
+// token service (cached; forceFetch bypasses the cached token). GET
+// /participants/me runs once per cache entry even when a static token and
+// ProviderSD are configured, because only it yields the identifier that binds a
+// consent to this provider. A configured ProviderSD wins over the fetched one.
 //
 // The global map lock is held only long enough to get-or-create this key's cache
-// entry; the login/me HTTP calls run under the entry's own lock. So a refresh for
+// entry; the token/me HTTP calls run under the entry's own lock. So a refresh for
 // one participant never blocks cache hits (or refreshes) for another, and
 // concurrent first requests for the same participant coalesce onto one fetch.
-func (c *Client) credentials(ctx context.Context, forceFetch bool) (token, providerSD string, err error) {
-	// Fully static: no cache or HTTP needed.
-	if c.staticToken != "" && c.providerSD != "" {
-		return c.staticToken, c.providerSD, nil
-	}
+func (c *Client) credentials(ctx context.Context, forceFetch bool) (participantCredentials, error) {
 	if c.staticToken == "" && c.tokenServiceURL == "" {
-		return "", "", ErrNoCredentials
+		return participantCredentials{}, ErrNoCredentials
 	}
 
 	// Get-or-create the per-key entry under the map lock (brief), then release it
@@ -333,15 +354,15 @@ func (c *Client) credentials(ctx context.Context, forceFetch bool) (token, provi
 	defer entry.mu.Unlock()
 
 	// Participant token: static override, or a cached/refreshed login token.
-	token = c.staticToken
+	token := c.staticToken
 	if token == "" {
 		if forceFetch {
 			entry.token = ""
 		}
 		if entry.token == "" || time.Now().After(entry.tokenExpiry) {
-			fetched, lifetime, lerr := c.fetchToken(ctx)
-			if lerr != nil {
-				return "", "", lerr
+			fetched, lifetime, err := c.fetchToken(ctx)
+			if err != nil {
+				return participantCredentials{}, err
 			}
 			entry.token = fetched
 			entry.tokenExpiry = time.Now().Add(cacheFor(lifetime, c.tokenTTL))
@@ -349,20 +370,32 @@ func (c *Client) credentials(ctx context.Context, forceFetch bool) (token, provi
 		token = entry.token
 	}
 
-	// Provider self-description: static override, or derived from /me (cached).
-	providerSD = c.providerSD
-	if providerSD == "" {
-		if entry.providerSD == "" {
-			sd, serr := c.fetchProviderSD(ctx, token)
-			if serr != nil {
-				return "", "", serr
-			}
-			entry.providerSD = sd
+	if entry.self == "" {
+		me, err := c.fetchSelf(ctx, token)
+		if err != nil {
+			return participantCredentials{}, err
 		}
-		providerSD = entry.providerSD
+		providerSD := c.providerSD
+		if providerSD == "" {
+			if me.SelfDescriptionURI == "" {
+				return participantCredentials{}, fmt.Errorf("consent client: /me returned no selfDescriptionUri")
+			}
+			providerSD = me.SelfDescriptionURI
+		}
+		entry.self, entry.providerSD = me.Identifier, providerSD
 	}
 
-	return token, providerSD, nil
+	return participantCredentials{token: token, providerSD: entry.providerSD, self: entry.self}, nil
+}
+
+// credentialsWithRetry is credentials with one token refresh when /me rejects a
+// cached token.
+func (c *Client) credentialsWithRetry(ctx context.Context) (participantCredentials, error) {
+	creds, err := c.credentials(ctx, false)
+	if errors.Is(err, errParticipantUnauthorized) && c.staticToken == "" {
+		creds, err = c.credentials(ctx, true)
+	}
+	return creds, err
 }
 
 // identifierCacheTTL bounds how long a (provider, subject) -> userIdentifier
@@ -395,20 +428,33 @@ func (c *Client) identifierCacheKey(providerSD, subject string) string {
 // participantSDCacheTTL bounds how long a DID -> self-description mapping is
 // reused. Participants change rarely, so a generous TTL keeps the registry call
 // off the request path.
+//
+// It is also the window in which a participant deregistered after its mapping
+// was cached still passes the registry gate. That is accepted: the consent check
+// itself runs uncached on every request, so the window only delays the explicit
+// "deregistered" deny reason and never skips the consent decision.
 const participantSDCacheTTL = 10 * time.Minute
 
-// participantSDNegativeTTL bounds how long a "no such participant" answer is
-// reused. Without it a single misconfigured DID re-fetches the whole participant
-// list on every request; with it, a participant that is genuinely registered
-// later is still picked up promptly.
+// participantSDNegativeTTL bounds how long a "no usable participant" answer is
+// reused. Without it a single misconfigured DID queries the registry on every
+// request; with it, a participant that is genuinely registered later is still
+// picked up promptly.
 const participantSDNegativeTTL = 30 * time.Second
+
+// Reasons a registry answer yields no usable self-description. Each one is final
+// (ErrParticipantNotRegistered), so none of them may be failed open on.
+const (
+	reasonNotRegistered     = "no participant registered"
+	reasonNoSelfDescription = "participant has no selfDescriptionUri"
+	reasonDeregistered      = "participant is deregistered"
+)
 
 type participantSDEntry struct {
 	selfDescriptionURL string
 	expiry             time.Time
-	// unknown marks a negative result: the registry answered, and no participant
-	// with this DID was in it.
-	unknown bool
+	// notRegisteredReason marks a negative result: the registry answered, and
+	// had no usable participant for this DID.
+	notRegisteredReason string
 }
 
 var (
@@ -416,23 +462,27 @@ var (
 	participantSDCache = map[string]participantSDEntry{}
 )
 
-// participantListEntry is the (subset of the) consent-manager participant record.
-type participantListEntry struct {
-	DID                string `json:"did"`
-	SelfDescriptionURL string `json:"selfDescriptionURL"`
+// participant is the (subset of the) dsc-consent-manager Participant record.
+type participant struct {
+	Identifier         string `json:"identifier"`
+	SelfDescriptionURI string `json:"selfDescriptionUri"`
+	// DeregisteredAt is set once the participant left; the registry keeps the
+	// record, and its selfDescriptionUri, after that.
+	DeregisteredAt string `json:"deregisteredAt"`
 }
 
-// participantsResponse tolerates both a bare array and a wrapped list.
-type participantsResponse struct {
-	Participants []participantListEntry `json:"participants"`
+// participantPage is the dsc-consent-manager ParticipantPage.
+type participantPage struct {
+	Content []participant `json:"content"`
 }
 
 // ParticipantSelfDescriptionByDID maps a participant DID to its self-description
-// URL using the consent-manager's participant registry. Contracts name their
-// parties by self-description URL, so a DID taken from a credential must be
-// translated before it can be used in a contract lookup. Results are cached for
-// participantSDCacheTTL, and "no such participant" for participantSDNegativeTTL,
-// so a misconfigured DID does not re-fetch the registry on every request.
+// URI using the consent-manager's participant registry. Contracts name their
+// parties by self-description, so a DID taken from a credential must be
+// translated before it can be used in a contract lookup. An unknown,
+// SD-less or deregistered participant returns ErrParticipantNotRegistered.
+// Results are cached for participantSDCacheTTL, and negative answers for
+// participantSDNegativeTTL.
 func (c *Client) ParticipantSelfDescriptionByDID(ctx context.Context, did string) (string, error) {
 	if did == "" {
 		return "", fmt.Errorf("consent client: empty participant did")
@@ -443,8 +493,8 @@ func (c *Client) ParticipantSelfDescriptionByDID(ctx context.Context, did string
 	entry, hit := participantSDCache[cacheKey]
 	participantSDMu.Unlock()
 	if hit && time.Now().Before(entry.expiry) {
-		if entry.unknown {
-			return "", notRegistered(did)
+		if entry.notRegisteredReason != "" {
+			return "", notRegistered(did, entry.notRegisteredReason)
 		}
 		return entry.selfDescriptionURL, nil
 	}
@@ -452,91 +502,83 @@ func (c *Client) ParticipantSelfDescriptionByDID(ctx context.Context, did string
 	// A cached token that has since been revoked would otherwise make the mapping
 	// terminally fail, and with it the whole exchange — so refresh and retry once,
 	// exactly as CheckConsent does for the check itself.
-	sd, err := c.lookupParticipantSD(ctx, did, false)
+	sd, reason, err := c.lookupParticipantSD(ctx, did, false)
 	if errors.Is(err, errParticipantUnauthorized) && c.staticToken == "" {
-		sd, err = c.lookupParticipantSD(ctx, did, true)
-	}
-	if errors.Is(err, errParticipantUnauthorized) {
-		return "", fmt.Errorf("consent client: participant token rejected (401) on participants lookup")
+		sd, reason, err = c.lookupParticipantSD(ctx, did, true)
 	}
 	if err != nil {
 		return "", err
 	}
 
 	participantSDMu.Lock()
-	if sd == "" {
-		participantSDCache[cacheKey] = participantSDEntry{unknown: true, expiry: time.Now().Add(participantSDNegativeTTL)}
+	if reason != "" {
+		participantSDCache[cacheKey] = participantSDEntry{notRegisteredReason: reason, expiry: time.Now().Add(participantSDNegativeTTL)}
 	} else {
 		participantSDCache[cacheKey] = participantSDEntry{selfDescriptionURL: sd, expiry: time.Now().Add(participantSDCacheTTL)}
 	}
 	participantSDMu.Unlock()
 
-	if sd == "" {
-		return "", notRegistered(did)
+	if reason != "" {
+		return "", notRegistered(did, reason)
 	}
 	return sd, nil
 }
 
-// notRegistered builds the "no such participant" error, wrapping the sentinel so
-// callers can tell a misconfigured DID from an unreachable registry.
+// notRegistered builds the "no usable participant" error, wrapping the sentinel
+// so callers can tell a misconfigured or departed DID from an unreachable
+// registry.
 //
 // The DID is fingerprinted rather than embedded: this error is both logged to
 // stdout and used as an audit reason, and a participant DID is an identifier
 // that belongs in the audit record's own field, not in free text.
-func notRegistered(did string) error {
-	return fmt.Errorf("%w: no participant registered for did %s", ErrParticipantNotRegistered, logging.Redact(did))
+func notRegistered(did, reason string) error {
+	return fmt.Errorf("%w: %s for did %s", ErrParticipantNotRegistered, reason, logging.Redact(did))
 }
 
-// lookupParticipantSD fetches the participant registry and returns the
-// self-description URL registered for did, or "" when the registry answered but
-// holds no such participant (a definite negative, not an error). forceLogin
+// lookupParticipantSD queries the participant registry for did. It returns the
+// self-description URI, or a non-empty reason when the registry answered but has
+// no usable participant (a definite negative, not an error). forceLogin
 // refreshes a cached token first.
-func (c *Client) lookupParticipantSD(ctx context.Context, did string, forceLogin bool) (string, error) {
-	token, _, err := c.credentials(ctx, forceLogin)
+func (c *Client) lookupParticipantSD(ctx context.Context, did string, forceLogin bool) (sd, reason string, err error) {
+	creds, err := c.credentials(ctx, forceLogin)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, c.endpoint(participantsPath), nil)
+	query := url.Values{identifierQueryParam: {did}}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, c.endpoint(participantsPath)+"?"+query.Encode(), nil)
 	if err != nil {
-		return "", fmt.Errorf("consent client: failed to create participants request: %w", err)
+		return "", "", fmt.Errorf("consent client: failed to create participants request: %w", err)
 	}
-	httpReq.Header.Set("Authorization", "Bearer "+token)
+	httpReq.Header.Set("Authorization", "Bearer "+creds.token)
 
 	status, body, err := c.do(httpReq)
 	if err != nil {
-		return "", err
-	}
-	if status == http.StatusUnauthorized {
-		return "", errParticipantUnauthorized
+		return "", "", err
 	}
 	if status != http.StatusOK {
-		return "", unexpectedStatus("participants lookup", status, body)
+		return "", "", statusError("participants lookup", status, body)
 	}
 
-	participants, err := decodeParticipants(body)
-	if err != nil {
-		return "", err
+	var page participantPage
+	if err := json.Unmarshal(body, &page); err != nil {
+		return "", "", fmt.Errorf("consent client: failed to unmarshal participants response: %w", err)
 	}
-	for _, p := range participants {
-		if p.DID == did && p.SelfDescriptionURL != "" {
-			return p.SelfDescriptionURL, nil
+	for _, p := range page.Content {
+		if p.Identifier != did {
+			continue
+		}
+		switch {
+		case p.DeregisteredAt != "":
+			// The registry keeps departed participants with their SD URI; only
+			// deregisteredAt tells them apart.
+			return "", reasonDeregistered, nil
+		case p.SelfDescriptionURI == "":
+			return "", reasonNoSelfDescription, nil
+		default:
+			return p.SelfDescriptionURI, "", nil
 		}
 	}
-	return "", nil
-}
-
-// decodeParticipants accepts either a bare array or a {"participants": [...]}
-// wrapper, since the consent-manager has used both shapes.
-func decodeParticipants(body []byte) ([]participantListEntry, error) {
-	var bare []participantListEntry
-	if err := json.Unmarshal(body, &bare); err == nil {
-		return bare, nil
-	}
-	var wrapped participantsResponse
-	if err := json.Unmarshal(body, &wrapped); err != nil {
-		return nil, fmt.Errorf("consent client: failed to unmarshal participants response: %w", err)
-	}
-	return wrapped.Participants, nil
+	return "", reasonNotRegistered, nil
 }
 
 // ProviderSelfDescription returns this participant's self-description URL - the
@@ -544,11 +586,11 @@ func decodeParticipants(body []byte) ([]participantListEntry, error) {
 // GET /participants/me (cached with the participant token). Callers use it to
 // name the provider side of a contract lookup.
 func (c *Client) ProviderSelfDescription(ctx context.Context) (string, error) {
-	_, providerSD, err := c.credentials(ctx, false)
+	creds, err := c.credentialsWithRetry(ctx)
 	if err != nil {
 		return "", err
 	}
-	return providerSD, nil
+	return creds.providerSD, nil
 }
 
 // loginResponse is the consent-manager response to POST /participants/login.
@@ -624,37 +666,31 @@ func (c *Client) fetchToken(ctx context.Context) (string, time.Duration, error) 
 	return out.AccessToken, time.Duration(out.ExpiresIn) * time.Second, nil
 }
 
-// meResponse is the (subset of the) consent-manager response to GET /participants/me.
-type meResponse struct {
-	SelfDescriptionURL string `json:"selfDescriptionURL"`
-}
-
-// fetchProviderSD reads the calling participant's self-description URL.
-func (c *Client) fetchProviderSD(ctx context.Context, token string) (string, error) {
+// fetchSelf reads the calling participant from GET /participants/me. An empty
+// identifier is ErrConsentManagerRejected: without it no consent can be bound to
+// this provider.
+func (c *Client) fetchSelf(ctx context.Context, token string) (participant, error) {
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, c.endpoint(participantMePath), nil)
 	if err != nil {
-		return "", fmt.Errorf("consent client: failed to create /me request: %w", err)
+		return participant{}, fmt.Errorf("consent client: failed to create /me request: %w", err)
 	}
 	httpReq.Header.Set("Authorization", "Bearer "+token)
 
 	status, body, err := c.do(httpReq)
 	if err != nil {
-		return "", err
-	}
-	if status == http.StatusUnauthorized {
-		return "", errParticipantUnauthorized
+		return participant{}, err
 	}
 	if status != http.StatusOK {
-		return "", unexpectedStatus("participant lookup (/me)", status, body)
+		return participant{}, statusError("participant lookup (/me)", status, body)
 	}
-	var out meResponse
+	var out participant
 	if err := json.Unmarshal(body, &out); err != nil {
-		return "", fmt.Errorf("consent client: failed to unmarshal /me response: %w", err)
+		return participant{}, fmt.Errorf("consent client: failed to unmarshal /me response: %w", err)
 	}
-	if out.SelfDescriptionURL == "" {
-		return "", fmt.Errorf("consent client: /me returned no selfDescriptionURL")
+	if out.Identifier == "" {
+		return participant{}, fmt.Errorf("%w: /me returned no identifier", ErrConsentManagerRejected)
 	}
-	return out.SelfDescriptionURL, nil
+	return out, nil
 }
 
 // identifierSearchResponse is the consent-manager response to the identifier search.
@@ -932,4 +968,29 @@ func unexpectedStatus(operation string, status int, body []byte) error {
 	logging.DebugfEvery("dependency-body:"+operation,
 		"consent client: %s returned status %d, body: %s", operation, status, logging.Sanitize(string(body)))
 	return fmt.Errorf("consent client: %s returned status %d", operation, status)
+}
+
+// statusError classifies a non-200 consent-manager status for every endpoint
+// alike, so fail-open can never apply to a permanent failure on one of them:
+//
+//   - 401: errParticipantUnauthorized (refresh and retry once; then final)
+//   - 403: ErrConsentManagerAuth, the caller may be deregistered
+//   - any other 4xx except 429: ErrConsentManagerRejected (misconfiguration)
+//   - 429, 5xx and anything else: a plain, retryable error
+//
+// The body stays out of the error, as with unexpectedStatus.
+func statusError(operation string, status int, body []byte) error {
+	plain := unexpectedStatus(operation, status, body)
+	switch {
+	case status == http.StatusUnauthorized:
+		return fmt.Errorf("%w (%w)", errParticipantUnauthorized, plain)
+	case status == http.StatusForbidden:
+		return fmt.Errorf("%w, the caller may be deregistered (%w)", ErrConsentManagerAuth, plain)
+	case status == http.StatusTooManyRequests:
+		return plain
+	case status >= http.StatusBadRequest && status < http.StatusInternalServerError:
+		return fmt.Errorf("%w (%w)", ErrConsentManagerRejected, plain)
+	default:
+		return plain
+	}
 }

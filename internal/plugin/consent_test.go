@@ -207,13 +207,7 @@ func newConsentManager(t *testing.T, userID string, statuses []string) *httptest
 	})
 	// The participant registry, used to translate the consumer DID from the token
 	// into the self-description URL a contract names its parties by.
-	mux.HandleFunc("/v1/participants", participantRegistryHandler)
-	mux.HandleFunc("/v1/participants/me", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{
-			"selfDescriptionURL": "http://catalog/participants/provider",
-		})
-	})
+	registerParticipantEndpoints(mux)
 	return httptest.NewServer(mux)
 }
 
@@ -223,20 +217,37 @@ func newConsentManager(t *testing.T, userID string, statuses []string) *httptest
 // contract lookup.
 func newFailingConsentManager() *httptest.Server {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/participants", participantRegistryHandler)
+	registerParticipantEndpoints(mux)
 	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	})
 	return httptest.NewServer(mux)
 }
 
-// participantRegistryHandler serves the consent-manager's participant registry,
-// which maps the consumer DID from the token to its self-description URL.
-func participantRegistryHandler(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode([]map[string]string{
-		{"did": testConsumerDID, "selfDescriptionURL": testConsumerSD},
+// testProviderDID is the identifier /participants/me reports for this participant.
+const testProviderDID = "did:key:zProvider"
+
+// registerParticipantEndpoints serves the participant registry and
+// /participants/me, which every client configuration now calls.
+func registerParticipantEndpoints(mux *http.ServeMux) {
+	mux.HandleFunc("/v1/participants", participantRegistryHandler)
+	mux.HandleFunc("/v1/participants/me", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"identifier": testProviderDID, "selfDescriptionUri": "http://catalog/participants/provider",
+		})
 	})
+}
+
+// participantRegistryHandler serves the consent-manager's participant registry,
+// which maps the consumer DID from the token to its self-description URI.
+func participantRegistryHandler(w http.ResponseWriter, r *http.Request) {
+	content := []map[string]string{}
+	if r.URL.Query().Get("identifier") == testConsumerDID {
+		content = append(content, map[string]string{"identifier": testConsumerDID, "selfDescriptionUri": testConsumerSD})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{"content": content})
 }
 
 // newUncalledConsentManager fails the test if a CONSENT CHECK reaches the
@@ -246,7 +257,7 @@ func participantRegistryHandler(w http.ResponseWriter, _ *http.Request) {
 func newUncalledConsentManager(t *testing.T) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/participants", participantRegistryHandler)
+	registerParticipantEndpoints(mux)
 	mux.HandleFunc("/", func(_ http.ResponseWriter, r *http.Request) {
 		t.Errorf("consent-manager must not be called for a consent check (path %s)", r.URL.Path)
 	})
@@ -677,7 +688,7 @@ func TestResponseFilter_ConsentScopedToConsumer(t *testing.T) {
 			"consents": consentsGrantedTo("http://catalog/participants/someone-else", []string{"granted"}),
 		})
 	})
-	mux.HandleFunc("/v1/participants", participantRegistryHandler)
+	registerParticipantEndpoints(mux)
 	server := httptest.NewServer(mux)
 	defer server.Close()
 
@@ -716,7 +727,7 @@ func TestResponseFilter_OwnerNotRequestor(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"consents": consentsGrantedTo(testConsumerSD, []string{"revoked"})})
 	})
-	mux.HandleFunc("/v1/participants", participantRegistryHandler)
+	registerParticipantEndpoints(mux)
 	server := httptest.NewServer(mux)
 	defer server.Close()
 
@@ -784,7 +795,7 @@ func TestResponseFilter_ResponsePhaseDeadline(t *testing.T) {
 	// that can end the wait.
 	release := make(chan struct{})
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/participants", participantRegistryHandler)
+	registerParticipantEndpoints(mux)
 	mux.HandleFunc("/", func(_ http.ResponseWriter, r *http.Request) {
 		select {
 		case <-release:
@@ -1575,7 +1586,7 @@ func TestAuditReasonCarriesNoDependencyBody(t *testing.T) {
 	defer collector.Close()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/participants", participantRegistryHandler)
+	registerParticipantEndpoints(mux)
 	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		// A dependency echoing personal data in its error page.
@@ -1606,4 +1617,24 @@ func TestAuditReasonCarriesNoDependencyBody(t *testing.T) {
 	}
 	assert.Contains(t, strings.Join(reasons, ""), "identifier search returned status 500",
 		"the reason should classify the failure instead")
+}
+
+// TestFailModeForError pins which dependency errors fail_open may never release on.
+func TestFailModeForError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want failMode
+	}{
+		{"no credentials", consent.ErrNoCredentials, failAlwaysClosed},
+		{"participant not registered", fmt.Errorf("wrapped: %w", consent.ErrParticipantNotRegistered), failAlwaysClosed},
+		{"consent-manager auth", fmt.Errorf("wrapped: %w", consent.ErrConsentManagerAuth), failAlwaysClosed},
+		{"consent-manager rejected", fmt.Errorf("wrapped: %w", consent.ErrConsentManagerRejected), failAlwaysClosed},
+		{"outage", errors.New("consent client: participants lookup returned status 503"), failByPolicy},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, failModeForError(tt.err))
+		})
+	}
 }
