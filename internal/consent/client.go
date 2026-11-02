@@ -29,6 +29,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -40,13 +42,39 @@ const (
 	// endpoint path (matches the consent-manager's API_PREFIX).
 	DefaultAPIPrefix = "/v1"
 
-	// identifierSearchPath resolves a subject to the provider-scoped user
-	// identifier. Carries the participant token only.
-	identifierSearchPath = "/users/identifier/search"
+	// consentsPath lists the consents the caller is a party to (list mode).
+	consentsPath = "/consents"
 
-	// participantConsentsPathFmt lists a user identifier's consents as seen by
-	// the participant. Authenticated with the participant JWT. %s = identifier.
-	participantConsentsPathFmt = "/consents/participants/%s"
+	// consentCheckPath answers whether a subject's consent to one notice is in force (check mode).
+	consentCheckPath = "/consents/check"
+
+	// consentByIDPathFmt reads one consent; %s is the path-escaped consent id.
+	consentByIDPathFmt = "/consents/%s"
+
+	// Query keys of the consent endpoints.
+	userIdentifierQueryParam  = "userIdentifier"
+	privacyNoticeIDQueryParam = "privacyNoticeId"
+	purposeQueryParam         = "purpose"
+	pageQueryParam            = "page"
+	sizeQueryParam            = "size"
+	formatQueryParam          = "format"
+
+	// consentFormatFull asks the consent read for a ConsentResponse; the receipt
+	// formats carry no provider, consumer or consented field to match on.
+	consentFormatFull = "full"
+
+	// consentListPageSize is the page size asked of GET /consents. The server
+	// clamps it to its own ceiling, and paging follows its totalPages.
+	consentListPageSize = 50
+
+	// maxConsentListPages caps how many pages one list-mode check reads, so an
+	// owner with a huge consent history cannot turn one check into an unbounded
+	// scan. Hitting the cap without a match denies.
+	maxConsentListPages = 20
+
+	// consentNotInForceReason is the fixed deny reason for valid:false; the
+	// server's own reason is free text and is only logged at debug level.
+	consentNotInForceReason = "consent not in force (check endpoint)"
 
 	// participantMePath returns the calling participant (identifier and selfDescriptionUri).
 	participantMePath = "/participants/me"
@@ -57,9 +85,6 @@ const (
 
 	// identifierQueryParam filters the participant registry by DID.
 	identifierQueryParam = "identifier"
-
-	// grantedStatus is the consent status that authorizes access.
-	grantedStatus = "granted"
 
 	// DefaultTimeoutMs is the default per-call HTTP timeout in milliseconds.
 	DefaultTimeoutMs = 5000
@@ -108,7 +133,7 @@ var ErrNoCredentials = errors.New("consent client: no participant_token and no t
 var ErrParticipantNotRegistered = errors.New("consent client: participant not registered")
 
 // ClientConfig holds everything needed to verify consent against the
-// (Prometheus-X / Visions) consent-manager.
+// dsc-consent-manager.
 type ClientConfig struct {
 	// BaseURL is the consent-manager root (e.g. "http://consent-manager:3000").
 	BaseURL string
@@ -131,24 +156,22 @@ type ClientConfig struct {
 	TimeoutMs int
 }
 
-// Client verifies consent against the consent-manager. The consent-manager has
-// no single "is there consent?" endpoint, so a check is a two-call chain:
+// Client verifies consent against the dsc-consent-manager. Each data owner is
+// checked as a userIdentifier in one of two modes (ConsentRequest.Mode):
 //
-//  1. POST {base}/users/identifier/search  — resolve the subject (a DID carried
-//     as the user "email") to the provider-scoped user identifier, scoped by the
-//     provider self-description.
-//  2. GET  {base}/consents/participants/{id}?receipt=true — list that user's
-//     consents, authenticated with the participant JWT.
+//   - list:  GET {base}/consents?userIdentifier=[&privacyNoticeId=], paged;
+//   - check: GET {base}/consents/check, then the mandatory GET {base}/consents/{id}.
+//
+// Either way a release needs one consent record that passes matchConsent, so the
+// consumer and provider binding never rests on the server's answer alone.
 //
 // The access token is obtained from the participant-local OID4VP token service
 // (POST {TokenServiceURL} with the configured audience), so this plugin holds no
-// participant credentials of its own: the token service presents the
-// participant's verifiable credential and returns a short-lived token. GET
-// /participants/me then yields this participant's own identifier and its
-// selfDescriptionUri. Tokens are cached package-wide (keyed by the full
-// credential identity, see cacheKey) and refreshed on expiry or a 401. Access is allowed iff a returned consent is
-// "granted" AND was granted to the consuming participant named in the request
-// (see hasGrantedConsent).
+// participant credentials of its own. GET /participants/me then yields this
+// participant's own identifier and its selfDescriptionUri. Tokens are cached
+// package-wide (keyed by the full credential identity, see cacheKey) and
+// refreshed on expiry or a 401. Consent answers are never cached, so a
+// revocation takes effect on the next request.
 type Client struct {
 	baseURL         string
 	apiPrefix       string
@@ -227,9 +250,8 @@ const credentialKeySeparator = "\x00"
 // self-description derived from it, so the key MUST cover every input that can
 // change either of them - otherwise two routes fronting different participants
 // but the same consent-manager share one entry, and whichever warms it first
-// makes the other run its identifier search scoped to the wrong provider and its
-// consents lookup as the wrong participant (silently wrong decisions in both
-// directions).
+// makes the other match consents against the wrong provider identity and read
+// them as the wrong participant (silently wrong decisions in both directions).
 //
 // Secrets are hashed rather than embedded so the key can be logged or ranged
 // over without leaking a token.
@@ -255,19 +277,31 @@ func hashSecret(secret string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// CheckConsent runs the two-call consent verification for req.Subject, allowing
-// when a granted consent exists and denying otherwise. An unknown subject is a
-// definite deny (not an error). A 401 from the participant-authenticated calls
-// triggers one token refresh + retry. Transport/protocol failures are returned
-// as errors so the caller can apply its fail policy.
+// CheckConsent checks req.Subject's consent in req.Mode, allowing only when a
+// consent record passes matchConsent. A missing subject, consumer or (in check
+// mode) notice id, or an unknown mode, is a definite deny, not an error. A 401 triggers one token
+// refresh and retry. Other failures are returned as errors (see statusError) so
+// the caller can apply its fail policy.
 func (c *Client) CheckConsent(ctx context.Context, req ConsentRequest) (*ConsentResponse, error) {
 	if req.Subject == "" {
-		return &ConsentResponse{Decision: DecisionDeny, Reason: "no subject in request"}, nil
+		return deny("no subject in request"), nil
 	}
 	// Without a named consumer the check degenerates into "does this subject have
 	// any consent at all?", which authorises the wrong agreement. Deny instead.
 	if req.Consumer == "" {
-		return &ConsentResponse{Decision: DecisionDeny, Reason: "no consuming participant identified"}, nil
+		return deny("no consuming participant identified"), nil
+	}
+	switch req.Mode {
+	case "", ModeList, ModeCheck:
+	default:
+		return deny("unknown consent check mode " + logging.Sanitize(string(req.Mode))), nil
+	}
+	if req.Mode == ModeCheck && req.PrivacyNoticeID == "" {
+		return deny("check mode needs a privacy notice id"), nil
+	}
+	// The API types privacyNoticeId as a UUID; anything else would be a 400.
+	if req.PrivacyNoticeID != "" && !IsUUID(req.PrivacyNoticeID) {
+		return deny("privacy notice id is not a UUID"), nil
 	}
 
 	resp, err := c.check(ctx, req, false)
@@ -279,45 +313,37 @@ func (c *Client) CheckConsent(ctx context.Context, req ConsentRequest) (*Consent
 	return resp, err
 }
 
-// check performs one full verification attempt. forceLogin refreshes a cached
-// token before use. The check is scoped by req: a granted consent counts only if
-// it was granted to req.Consumer and, when set, covers req.DataResource and
-// req.Purpose.
+// check performs one verification attempt in req.Mode. forceLogin refreshes a
+// cached token before use.
 func (c *Client) check(ctx context.Context, req ConsentRequest, forceLogin bool) (*ConsentResponse, error) {
 	creds, err := c.credentials(ctx, forceLogin)
 	if err != nil {
 		return nil, err
 	}
-	token := creds.token
-
-	userIdentifier, found, err := c.resolveUserIdentifier(ctx, req.Subject, creds.providerSD, token)
-	if err != nil {
-		return nil, err
+	if req.Mode == ModeCheck {
+		return c.checkValidity(ctx, creds, req)
 	}
-	if !found {
-		return &ConsentResponse{Decision: DecisionDeny, Reason: "no user identifier for subject"}, nil
-	}
-
-	granted, err := c.hasGrantedConsent(ctx, token, userIdentifier, req)
-	if err != nil {
-		return nil, err
-	}
-	if granted {
-		return &ConsentResponse{Decision: DecisionAllow}, nil
-	}
-	return &ConsentResponse{Decision: DecisionDeny, Reason: noGrantedConsentReason(req)}, nil
+	return c.listConsents(ctx, creds, req)
 }
 
-// noGrantedConsentReason explains which scope the deny was decided at, so the
+// deny builds a deny verdict with reason.
+func deny(reason string) *ConsentResponse {
+	return &ConsentResponse{Decision: DecisionDeny, Reason: reason}
+}
+
+// noMatchingConsentReason explains which scope the deny was decided at, so the
 // audit record distinguishes "this subject consented to someone else" from
-// "this subject did not consent to this resource".
-func noGrantedConsentReason(req ConsentRequest) string {
+// "this subject did not consent to this purpose".
+func noMatchingConsentReason(req ConsentRequest) string {
 	reason := "no granted consent for consumer " + req.Consumer
 	if req.Purpose != "" {
 		reason += " and purpose " + req.Purpose
 	}
-	if req.DataResource != "" {
-		reason += " covering resource " + req.DataResource
+	if req.ContractURI != "" {
+		reason += " under contract " + req.ContractURI
+	}
+	if req.PrivacyNoticeID != "" {
+		reason += " under privacy notice " + req.PrivacyNoticeID
 	}
 	return reason
 }
@@ -396,33 +422,6 @@ func (c *Client) credentialsWithRetry(ctx context.Context) (participantCredentia
 		creds, err = c.credentials(ctx, true)
 	}
 	return creds, err
-}
-
-// identifierCacheTTL bounds how long a (provider, subject) -> userIdentifier
-// mapping is reused. The mapping is stable for the life of the registration, so
-// a short TTL is enough to collapse the repeated searches a single multi-owner
-// response would otherwise make, without holding a stale identifier.
-//
-// Only POSITIVE results are cached. "Unknown subject" must be re-asked every
-// time: a data subject can register at any moment, and remembering that they
-// were unknown would keep denying them after they had consented.
-const identifierCacheTTL = 60 * time.Second
-
-type identifierEntry struct {
-	userIdentifier string
-	expiry         time.Time
-}
-
-var (
-	identifierMu    sync.Mutex
-	identifierCache = map[string]identifierEntry{}
-)
-
-// identifierCacheKey scopes a cached identifier to the credential identity and
-// the provider it was resolved for - the identifier is provider-scoped, so it
-// must never be reused across providers.
-func (c *Client) identifierCacheKey(providerSD, subject string) string {
-	return strings.Join([]string{c.cacheKey(), providerSD, subject}, credentialKeySeparator)
 }
 
 // participantSDCacheTTL bounds how long a DID -> self-description mapping is
@@ -593,7 +592,6 @@ func (c *Client) ProviderSelfDescription(ctx context.Context) (string, error) {
 	return creds.providerSD, nil
 }
 
-// loginResponse is the consent-manager response to POST /participants/login.
 // tokenResponse is the OAuth2-shaped reply of the participant-local token service.
 type tokenResponse struct {
 	AccessToken string `json:"access_token"`
@@ -641,9 +639,8 @@ func (c *Client) fetchToken(ctx context.Context) (string, time.Duration, error) 
 	}
 	httpReq.Header.Set("Content-Type", ContentTypeJSON)
 
-	// Deliberately not c.do(): the token service is a local, same-namespace
-	// service, not the consent-manager, so the Host override and API prefix that
-	// c.do() applies for the gateway route must not be used here.
+	// Deliberately not c.endpoint(): the token service is a local, same-namespace
+	// service, not the consent-manager, so the API prefix must not be applied.
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
 		return "", 0, fmt.Errorf("consent client: token service request failed: %w", err)
@@ -693,237 +690,151 @@ func (c *Client) fetchSelf(ctx context.Context, token string) (participant, erro
 	return out, nil
 }
 
-// identifierSearchResponse is the consent-manager response to the identifier search.
-type identifierSearchResponse struct {
-	UserIdentifier string `json:"userIdentifier"`
-}
-
-// resolveUserIdentifier performs call 1: it maps the subject (a DID, sent as the
-// user "email") to the provider-scoped user identifier. A 404 or empty identifier
-// means the subject is unknown (found == false).
-//
-// A positive result is cached for identifierCacheTTL, so a response resolving to
-// the same owner under several data resources searches once instead of once per
-// resource.
-//
-// It carries the participant token as a Bearer credential, so an authenticating
-// facade in front of the consent-manager can validate the participant JWT on
-// this call too.
-func (c *Client) resolveUserIdentifier(ctx context.Context, subject, providerSD, token string) (identifier string, found bool, err error) {
-	cacheKey := c.identifierCacheKey(providerSD, subject)
-	identifierMu.Lock()
-	entry, hit := identifierCache[cacheKey]
-	identifierMu.Unlock()
-	if hit && time.Now().Before(entry.expiry) {
-		return entry.userIdentifier, true, nil
-	}
-
-	payload, err := json.Marshal(map[string]string{"selfDescription": providerSD, "email": subject})
-	if err != nil {
-		return "", false, fmt.Errorf("consent client: failed to marshal identifier search: %w", err)
-	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint(identifierSearchPath), bytes.NewReader(payload))
-	if err != nil {
-		return "", false, fmt.Errorf("consent client: failed to create identifier search request: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", ContentTypeJSON)
-	if token != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+token)
-	}
-
-	status, body, err := c.do(httpReq)
-	if err != nil {
-		return "", false, err
-	}
-	if status == http.StatusNotFound {
-		return "", false, nil
-	}
-	if status == http.StatusUnauthorized {
-		// a facade in front of the consent-manager rejected the participant token
-		return "", false, errParticipantUnauthorized
-	}
-	if status != http.StatusOK {
-		return "", false, unexpectedStatus("identifier search", status, body)
-	}
-	var out identifierSearchResponse
-	if err := json.Unmarshal(body, &out); err != nil {
-		return "", false, fmt.Errorf("consent client: failed to unmarshal identifier search response: %w", err)
-	}
-	if out.UserIdentifier == "" {
-		return "", false, nil
-	}
-	identifierMu.Lock()
-	identifierCache[cacheKey] = identifierEntry{userIdentifier: out.UserIdentifier, expiry: time.Now().Add(identifierCacheTTL)}
-	identifierMu.Unlock()
-	return out.UserIdentifier, true, nil
-}
-
-// participantConsentsResponse is the consent-manager response to call 2. The
-// ?receipt=true form returns the raw consents, each carrying its status, the
-// consumer it was granted to, the purposes it covers and the data resources it
-// covers.
-type participantConsentsResponse struct {
-	Consents []consentRecord `json:"consents"`
-}
-
-// consentRecord is the (subset of the) consent receipt the plugin decides on.
+// consentRecord is the subset of the dsc-consent-manager ConsentResponse the
+// plugin decides on. Its data[] holds the notice's personal-data categories, not
+// resource identifiers, so it is not decoded and never matched.
 type consentRecord struct {
-	Status string `json:"status"`
-	Data   []struct {
-		Resource string `json:"resource"`
-	} `json:"data"`
-	// Consumer / DataConsumer are the two field names the consent-manager has
-	// used for the participant the data is released to; either may be present.
-	Consumer     participantRef `json:"consumer"`
-	DataConsumer participantRef `json:"dataConsumer"`
-	// Recipients names the parties the data is released to, by self-description
-	// URL. It is the only place the consumer appears in a form the plugin can
-	// compare: on the `?receipt=true` records, `dataConsumer` is a bare Mongo id,
-	// which matches nothing the plugin holds.
-	Recipients []string `json:"recipients"`
-	Purposes   []struct {
-		ID      string `json:"_id"`
-		Purpose string `json:"purpose"`
-	} `json:"purposes"`
+	ID              string `json:"id"`
+	PrivacyNoticeID string `json:"privacyNoticeId"`
+	// Consented is derived from status by the server, and is the field the API
+	// designates for "may data be processed under this record now".
+	Consented bool `json:"consented"`
+	// Provider and Consumer are participant identifiers (DIDs).
+	Provider    string   `json:"provider"`
+	Consumer    string   `json:"consumer"`
+	Purposes    []string `json:"purposes"`
+	ContractURI string   `json:"contractUri"`
 }
 
-// participantRef is a participant named inside a consent record. The
-// consent-manager returns it either as a bare identifier string or as an
-// embedded object, so it decodes both shapes and matches on any of the
-// identifiers it carries.
-type participantRef struct {
-	ID                 string `json:"_id"`
-	DID                string `json:"did"`
-	SelfDescriptionURL string `json:"selfDescriptionURL"`
-	// literal holds the value when the field was a bare string rather than an object.
-	literal string
+// consentPage is the dsc-consent-manager ConsentPage.
+type consentPage struct {
+	Content    []consentRecord `json:"content"`
+	TotalPages int             `json:"totalPages"`
 }
 
-// UnmarshalJSON accepts either a bare identifier string or a participant object.
-func (p *participantRef) UnmarshalJSON(data []byte) error {
-	var literal string
-	if err := json.Unmarshal(data, &literal); err == nil {
-		p.literal = literal
-		return nil
-	}
-	// Alias avoids recursing into this method while decoding the object form.
-	type participantRefObject participantRef
-	var obj participantRefObject
-	if err := json.Unmarshal(data, &obj); err != nil {
-		return fmt.Errorf("consent client: failed to unmarshal participant reference: %w", err)
-	}
-	*p = participantRef(obj)
-	return nil
+// consentValidity is the dsc-consent-manager ConsentValidity.
+type consentValidity struct {
+	Valid     bool   `json:"valid"`
+	ConsentID string `json:"consentId"`
+	Reason    string `json:"reason"`
 }
 
-// matches reports whether this reference denotes the given participant identity
-// (a self-description URL, but a record may name the participant by its id or
-// DID instead). An empty reference matches nothing.
-func (p participantRef) matches(identity string) bool {
-	if identity == "" {
-		return false
-	}
-	for _, candidate := range []string{p.SelfDescriptionURL, p.ID, p.DID, p.literal} {
-		if candidate != "" && candidate == identity {
-			return true
+// matchConsent reports whether record authorises releasing req.Subject's data
+// to req.Consumer on behalf of this participant (self). Both modes use it, so a
+// release never rests on the server's filters alone:
+//
+//   - consented must be true;
+//   - provider must be self: the consent endpoints also return consents in
+//     which this participant is the CONSUMER of another provider's contract;
+//   - consumer must be req.Consumer: a consent granted to participant X is no
+//     authority for participant Y;
+//   - contractUri, privacyNoticeId and purposes must match req's values when
+//     those are set.
+//
+// Matching is verbatim and case-sensitive.
+func matchConsent(req ConsentRequest, self string, record consentRecord) bool {
+	return record.Consented &&
+		self != "" && record.Provider == self &&
+		req.Consumer != "" && record.Consumer == req.Consumer &&
+		(req.ContractURI == "" || record.ContractURI == req.ContractURI) &&
+		(req.PrivacyNoticeID == "" || record.PrivacyNoticeID == req.PrivacyNoticeID) &&
+		(req.Purpose == "" || slices.Contains(record.Purposes, req.Purpose))
+}
+
+// listConsents is list mode: it pages through GET /consents for req.Subject
+// until a record passes matchConsent, the last page is read, or
+// maxConsentListPages is reached (a deny).
+func (c *Client) listConsents(ctx context.Context, creds participantCredentials, req ConsentRequest) (*ConsentResponse, error) {
+	for page := 0; page < maxConsentListPages; page++ {
+		query := url.Values{
+			userIdentifierQueryParam: {req.Subject},
+			pageQueryParam:           {strconv.Itoa(page)},
+			sizeQueryParam:           {strconv.Itoa(consentListPageSize)},
+		}
+		if req.PrivacyNoticeID != "" {
+			query.Set(privacyNoticeIDQueryParam, req.PrivacyNoticeID)
+		}
+		var out consentPage
+		if _, err := c.getJSON(ctx, creds.token, c.endpoint(consentsPath)+"?"+query.Encode(), "consents list", &out); err != nil {
+			return nil, err
+		}
+		for _, record := range out.Content {
+			if matchConsent(req, creds.self, record) {
+				return &ConsentResponse{Decision: DecisionAllow, ConsentID: record.ID}, nil
+			}
+		}
+		if len(out.Content) == 0 || page+1 >= out.TotalPages {
+			return deny(noMatchingConsentReason(req)), nil
 		}
 	}
-	return false
+	return deny(fmt.Sprintf("%s in the first %d consent pages", noMatchingConsentReason(req), maxConsentListPages)), nil
 }
 
-// grantedTo reports whether the consent was granted to the given consumer.
-//
-// The consumer arrives as a self-description URL (mapped from the presented
-// credential's DID). On a `?receipt=true` record the consent-manager names the
-// consumer only as an internal id in `dataConsumer`, so the SD comparison has to
-// fall back to `recipients`.
-//
-// Only the FIRST recipient counts, because that is exactly how the authority
-// itself reads the field: the consent-manager resolves the data consumer as
-// `recipients[0]` (consentsController). Matching any recipient would authorise a
-// party the authority would not treat as the consumer.
-func (r consentRecord) grantedTo(consumer string) bool {
-	if r.Consumer.matches(consumer) || r.DataConsumer.matches(consumer) {
-		return true
+// checkValidity is check mode: GET /consents/check, then, on valid:true, the
+// mandatory GET /consents/{consentId}?format=full whose record must pass
+// matchConsent. The check endpoint says nothing about the consumer, so valid:true
+// alone would let any consumer through on another consumer's grant. A 404 on
+// the read means this participant is not a party to that consent: a deny.
+func (c *Client) checkValidity(ctx context.Context, creds participantCredentials, req ConsentRequest) (*ConsentResponse, error) {
+	query := url.Values{
+		userIdentifierQueryParam:  {req.Subject},
+		privacyNoticeIDQueryParam: {req.PrivacyNoticeID},
 	}
-	return len(r.Recipients) > 0 && r.Recipients[0] != "" && r.Recipients[0] == consumer
-}
+	if req.Purpose != "" {
+		query.Set(purposeQueryParam, req.Purpose)
+	}
+	var validity consentValidity
+	if _, err := c.getJSON(ctx, creds.token, c.endpoint(consentCheckPath)+"?"+query.Encode(), "consent check", &validity); err != nil {
+		return nil, err
+	}
+	if !validity.Valid {
+		// reason is free text from a response body, so it stays out of the audit
+		// reason (see unexpectedStatus) and is only logged at debug level.
+		logging.DebugfEvery("consent-check-reason",
+			"consent client: consent check not valid, reason: %s", logging.Sanitize(validity.Reason))
+		return deny(consentNotInForceReason), nil
+	}
+	// consentId comes from a response body and ends up in a URL path.
+	if !IsUUID(validity.ConsentID) {
+		return deny("consent check returned no usable consentId"), nil
+	}
 
-// coversPurpose reports whether the consent covers the given processing purpose.
-// An empty purpose means the caller could not determine one, so the purpose is
-// not part of the match.
-func (r consentRecord) coversPurpose(purpose string) bool {
-	if purpose == "" {
-		return true
+	target := c.endpoint(fmt.Sprintf(consentByIDPathFmt, url.PathEscape(validity.ConsentID))) +
+		"?" + url.Values{formatQueryParam: {consentFormatFull}}.Encode()
+	var record consentRecord
+	status, err := c.getJSON(ctx, creds.token, target, "consent read", &record)
+	if status == http.StatusNotFound {
+		return deny("consent " + validity.ConsentID + " is not readable by this participant"), nil
 	}
-	for _, p := range r.Purposes {
-		if p.Purpose == purpose || p.ID == purpose {
-			return true
-		}
-	}
-	return false
-}
-
-// coversResource reports whether the consent covers the given data resource. An
-// empty resource means the check is owner-level and any resource qualifies.
-func (r consentRecord) coversResource(dataResource string) bool {
-	if dataResource == "" {
-		return true
-	}
-	for _, d := range r.Data {
-		if d.Resource == dataResource {
-			return true
-		}
-	}
-	return false
-}
-
-// hasGrantedConsent performs call 2: it lists the user identifier's consents as
-// seen by the participant and reports whether any of them authorizes THIS
-// access. A consent qualifies only when all of the following hold:
-//
-//   - its status is "granted";
-//   - it was granted to req.Consumer — a consent names one consumer, and one
-//     granted to participant X is not authority for participant Y to read the
-//     same data;
-//   - it covers req.Purpose, when the caller could determine one;
-//   - it covers req.DataResource, when the check is resource-scoped.
-//
-// A record that names no consumer therefore never qualifies: the plugin cannot
-// tell whose agreement it is, and guessing would authorise a processing purpose
-// the subject never agreed to. A 401 is returned as errParticipantUnauthorized
-// so the caller can refresh the token and retry.
-func (c *Client) hasGrantedConsent(ctx context.Context, token, userIdentifier string, req ConsentRequest) (bool, error) {
-	endpoint := c.endpoint(fmt.Sprintf(participantConsentsPathFmt, url.PathEscape(userIdentifier))) + "?receipt=true"
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return false, fmt.Errorf("consent client: failed to create consents request: %w", err)
+		return nil, err
+	}
+	if !matchConsent(req, creds.self, record) {
+		return deny(fmt.Sprintf("consent %s does not match: %s", validity.ConsentID, noMatchingConsentReason(req))), nil
+	}
+	return &ConsentResponse{Decision: DecisionAllow, ConsentID: validity.ConsentID}, nil
+}
+
+// getJSON GETs target with the bearer token and decodes a 200 body into out. A
+// non-200 status is returned together with its statusError classification.
+func (c *Client) getJSON(ctx context.Context, token, target, operation string, out any) (int, error) {
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		return 0, fmt.Errorf("consent client: failed to create %s request: %w", operation, err)
 	}
 	httpReq.Header.Set("Authorization", "Bearer "+token)
 
 	status, body, err := c.do(httpReq)
 	if err != nil {
-		return false, err
-	}
-	if status == http.StatusUnauthorized {
-		return false, errParticipantUnauthorized
+		return 0, err
 	}
 	if status != http.StatusOK {
-		return false, unexpectedStatus("consents lookup", status, body)
+		return status, statusError(operation, status, body)
 	}
-	var out participantConsentsResponse
-	if err := json.Unmarshal(body, &out); err != nil {
-		return false, fmt.Errorf("consent client: failed to unmarshal consents response: %w", err)
+	if err := json.Unmarshal(body, out); err != nil {
+		return status, fmt.Errorf("consent client: failed to unmarshal %s response: %w", operation, err)
 	}
-	for _, record := range out.Consents {
-		if record.Status != grantedStatus {
-			continue
-		}
-		if record.grantedTo(req.Consumer) && record.coversPurpose(req.Purpose) && record.coversResource(req.DataResource) {
-			return true, nil
-		}
-	}
-	return false, nil
+	return status, nil
 }
 
 // endpoint builds a full URL from the base URL, the API prefix and a path.

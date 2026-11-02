@@ -379,7 +379,7 @@ func (c *ConsentFilter) evaluateWithResolver(cfg *Config, w pkgHTTP.Response, ke
 			key, nil)
 	}
 
-	return checkOwners(phaseCtx, cfg, key, reqCtx, consentClient, claims, consumerSD)
+	return checkOwners(phaseCtx, cfg, key, reqCtx, consentClient, claims, consumerDID)
 }
 
 // checkPurposeScoping reports whether every resolved claim carries a processing
@@ -456,7 +456,7 @@ const maxConcurrentConsentChecks = 8
 // could return would change the answer. The results are then reduced by
 // reduceOwnerResults, which ranks them so the verdict does not depend on which
 // goroutine happened to finish first.
-func checkOwners(ctx context.Context, cfg *Config, key string, reqCtx *RequestContext, client *consent.Client, claims []ownerClaim, consumerSD string) responseOutcome {
+func checkOwners(ctx context.Context, cfg *Config, key string, reqCtx *RequestContext, client *consent.Client, claims []ownerClaim, consumerDID string) responseOutcome {
 	results := make([]ownerCheckResult, len(claims))
 	checksCtx, cancelChecks := context.WithCancel(ctx)
 	defer cancelChecks()
@@ -480,7 +480,7 @@ func checkOwners(ctx context.Context, cfg *Config, key string, reqCtx *RequestCo
 				Resource:     reqCtx.Path,
 				Method:       reqCtx.Method,
 				DataResource: claim.dataResource,
-				Consumer:     consumerSD,
+				Consumer:     consumerDID,
 				Purpose:      claim.purpose,
 			}
 			results[i].attempted = true

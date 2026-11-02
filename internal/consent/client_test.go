@@ -26,6 +26,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -40,12 +41,30 @@ const tokenServicePath = "/internal/tokens"
 // testAudience is the configured token-service target the tests ask for.
 const testAudience = "consent-manager"
 
-// testConsumerSD is the self-description URL of the participant the data is
-// released to — the consumer every check is scoped to.
+// testConsumerSD is the self-description URL of the consuming participant; it is
+// what the registry maps testConsumerDID to, and never what a consent names.
 const testConsumerSD = "http://catalog/participants/consumer"
 
 // testProviderDID is the identifier /participants/me reports for this participant.
 const testProviderDID = "did:key:zProvider"
+
+// Identities and scopes of the consent the tests grant.
+const (
+	testConsumerDID  = "did:key:zConsumer"
+	testOwnerDID     = "did:key:zOwner"
+	testConsentID    = "3f2b8c1e-5a4d-4e6f-9b7a-1c2d3e4f5a6b"
+	testNoticeID     = "7d9e0f1a-2b3c-4d5e-8f6a-7b8c9d0e1f2a"
+	testContractURI  = "https://catalog/contracts/trip-insurance"
+	testPurpose      = "Calculating an insurance quote from trip records."
+	testDataCategory = "Trip records"
+)
+
+// legacyConsentKeyMarker is part of the name of the consent-key header the old
+// consent-manager required; no request may carry such a header any more.
+const legacyConsentKeyMarker = "consent-key"
+
+// malformedJSONBody is a 200 body that does not decode as JSON.
+const malformedJSONBody = `{"content": [`
 
 // writeMe answers /participants/me with this participant's identifier and sd.
 func writeMe(w http.ResponseWriter, sd string) {
@@ -53,29 +72,92 @@ func writeMe(w http.ResponseWriter, sd string) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"identifier": testProviderDID, "selfDescriptionUri": sd})
 }
 
-// mockCM is a configurable mock covering the four endpoints the client uses: the
-// participant-local token service (/internal/tokens, served here for convenience
-// on the same test server), plus the consent-manager's /participants/me,
-// /users/identifier/search and /consents/participants/{id}.
+// writeJSON answers with v as a JSON body.
+func writeJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+// grantedConsent is a consent that matches every scope of matchingRequest.
+func grantedConsent() consentRecord {
+	return consentRecord{
+		ID:              testConsentID,
+		PrivacyNoticeID: testNoticeID,
+		Consented:       true,
+		Provider:        testProviderDID,
+		Consumer:        testConsumerDID,
+		Purposes:        []string{testPurpose},
+		ContractURI:     testContractURI,
+	}
+}
+
+// matchingRequest is a fully scoped request that grantedConsent satisfies.
+func matchingRequest(mode Mode) ConsentRequest {
+	return ConsentRequest{
+		Subject:         testOwnerDID,
+		Consumer:        testConsumerDID,
+		Mode:            mode,
+		PrivacyNoticeID: testNoticeID,
+		ContractURI:     testContractURI,
+		Purpose:         testPurpose,
+	}
+}
+
+// wireConsent is the ConsentResponse JSON the mock serves for r, with data[]
+// set to a notice category that matches no resource identifier.
+func wireConsent(r consentRecord) map[string]any {
+	raw, _ := json.Marshal(r)
+	out := map[string]any{}
+	_ = json.Unmarshal(raw, &out)
+	out["data"] = []string{testDataCategory}
+	return out
+}
+
+// mockCM is a configurable dsc-consent-manager fake: the participant-local token
+// service (served on the same test server for convenience), /participants/me,
+// GET /consents (list), GET /consents/check and GET /consents/{id}.
 type mockCM struct {
 	mu sync.Mutex
 	// behaviour
-	userID              string     // identifier-search result ("" => 404)
-	statuses            []string   // consents statuses
-	resourcesPerConsent [][]string // optional data[].resource per consent (index-aligned with statuses)
-	selfDescriptionURL  string     // /me result
-	consentConsumer     string     // consumer the returned consents name (defaults to testConsumerSD)
-	// consentUsesRecipients emits the REAL ?receipt=true shape: `dataConsumer` as a
-	// bare Mongo id plus `recipients: [<sd>]`, instead of an expanded `consumer`.
-	consentUsesRecipients bool
-	consentPurposes       []string // optional purposes the returned consents cover
-	tokenStatus           int      // non-200 => the token service fails with this status
-	failFirstConsents     bool     // first consents call 401s, then succeeds
+	consents           []consentRecord          // what GET /consents pages through
+	pageSize           int                      // overrides the requested page size when > 0
+	validity           consentValidity          // what GET /consents/check answers
+	byID               map[string]consentRecord // what GET /consents/{id} answers (missing => 404)
+	selfDescriptionURL string                   // /me result
+	tokenStatus        int                      // non-200 => the token service fails with this status
+	// failStatuses are answered, in order, by the list/check endpoint before it succeeds.
+	failStatuses []int
+	readStatus   int // non-zero => GET /consents/{id} answers with it
+	// malformedBody / malformedRead answer 200 with an undecodable body on the
+	// list/check endpoint / the consent read.
+	malformedBody, malformedRead bool
+	delay                        time.Duration // delays every consent endpoint
 	// recording
-	tokenCalls, meCalls, searchCalls, consentsCalls int
-	lastSearchEmail, lastSearchSD                   string
-	lastConsentsAuth, lastTokenAudience             string
-	tokenCounter                                    int
+	tokenCalls, meCalls, listCalls, checkCalls, readCalls int
+	lastQuery, lastReadQuery                              url.Values
+	lastAuth, lastTokenAudience                           string
+	sawConsentKey                                         bool
+	tokenCounter                                          int
+}
+
+// record notes a consent-endpoint request; the caller holds m.mu.
+func (m *mockCM) record(r *http.Request) {
+	m.lastAuth = r.Header.Get("Authorization")
+	for name := range r.Header {
+		if strings.Contains(strings.ToLower(name), legacyConsentKeyMarker) {
+			m.sawConsentKey = true
+		}
+	}
+}
+
+// nextFailure pops the next queued failure status, or 0; the caller holds m.mu.
+func (m *mockCM) nextFailure() int {
+	if len(m.failStatuses) == 0 {
+		return 0
+	}
+	st := m.failStatuses[0]
+	m.failStatuses = m.failStatuses[1:]
+	return st
 }
 
 func newMockCM(t *testing.T, m *mockCM) *httptest.Server {
@@ -96,13 +178,10 @@ func newMockCM(t *testing.T, m *mockCM) *httptest.Server {
 			w.WriteHeader(st)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"access_token": tok, "token_type": "Bearer", "expires_in": 3600,
-		})
+		writeJSON(w, map[string]any{"access_token": tok, "token_type": "Bearer", "expires_in": 3600})
 	})
 
-	mux.HandleFunc("/v1/participants/me", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /v1/participants/me", func(w http.ResponseWriter, _ *http.Request) {
 		m.mu.Lock()
 		m.meCalls++
 		sd := m.selfDescriptionURL
@@ -110,76 +189,81 @@ func newMockCM(t *testing.T, m *mockCM) *httptest.Server {
 		writeMe(w, sd)
 	})
 
-	mux.HandleFunc("/v1/users/identifier/search", func(w http.ResponseWriter, r *http.Request) {
-		var body map[string]string
-		_ = json.NewDecoder(r.Body).Decode(&body)
+	mux.HandleFunc("GET /v1/consents", func(w http.ResponseWriter, r *http.Request) {
 		m.mu.Lock()
-		m.searchCalls++
-		m.lastSearchEmail = body["email"]
-		m.lastSearchSD = body["selfDescription"]
-		uid := m.userID
+		m.listCalls++
+		m.record(r)
+		m.lastQuery = r.URL.Query()
+		fail := m.nextFailure()
+		consents := append([]consentRecord(nil), m.consents...)
+		size := m.pageSize
+		delay, malformed := m.delay, m.malformedBody
 		m.mu.Unlock()
-		if uid == "" {
-			w.WriteHeader(http.StatusNotFound)
+		time.Sleep(delay)
+		if fail != 0 {
+			w.WriteHeader(fail)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{"userIdentifier": uid})
+		if malformed {
+			writeMalformed(w)
+			return
+		}
+		if size <= 0 {
+			size, _ = strconv.Atoi(r.URL.Query().Get(sizeQueryParam))
+		}
+		page, _ := strconv.Atoi(r.URL.Query().Get(pageQueryParam))
+		content := []map[string]any{}
+		for i := page * size; i < (page+1)*size && i < len(consents); i++ {
+			content = append(content, wireConsent(consents[i]))
+		}
+		writeJSON(w, map[string]any{
+			"content": content, "page": page, "size": size,
+			"totalElements": len(consents), "totalPages": (len(consents) + size - 1) / size,
+		})
 	})
 
-	mux.HandleFunc("/v1/consents/participants/", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /v1/consents/check", func(w http.ResponseWriter, r *http.Request) {
 		m.mu.Lock()
-		m.consentsCalls++
-		n := m.consentsCalls
-		m.lastConsentsAuth = r.Header.Get("Authorization")
-		fail := m.failFirstConsents
-		sts := append([]string(nil), m.statuses...)
-		res := append([][]string(nil), m.resourcesPerConsent...)
-		useRecipients := m.consentUsesRecipients
-		consumer := m.consentConsumer
-		if consumer == "" {
-			consumer = testConsumerSD
-		}
-		// "none" makes the mock return a consent record that names no consumer.
-		omitConsumer := consumer == "none"
-		purposes := append([]string(nil), m.consentPurposes...)
+		m.checkCalls++
+		m.record(r)
+		m.lastQuery = r.URL.Query()
+		fail := m.nextFailure()
+		validity := m.validity
+		delay, malformed := m.delay, m.malformedBody
 		m.mu.Unlock()
-		if fail && n == 1 {
-			w.WriteHeader(http.StatusUnauthorized)
+		time.Sleep(delay)
+		if fail != 0 {
+			w.WriteHeader(fail)
 			return
 		}
-		consents := make([]map[string]interface{}, 0, len(sts))
-		for i, s := range sts {
-			consent := map[string]interface{}{"status": s}
-			if !omitConsumer {
-				if useRecipients {
-					// The real ?receipt=true shape: the consumer appears as a bare
-					// Mongo id in dataConsumer, and only `recipients` carries the
-					// self-description URL the plugin can compare against.
-					consent["dataConsumer"] = "6a95131a0a7640f7f6dee2d2"
-					consent["recipients"] = []string{consumer}
-				} else {
-					consent["consumer"] = map[string]string{"selfDescriptionURL": consumer}
-				}
-			}
-			if len(purposes) > 0 {
-				ps := make([]map[string]string, 0, len(purposes))
-				for _, p := range purposes {
-					ps = append(ps, map[string]string{"purpose": p})
-				}
-				consent["purposes"] = ps
-			}
-			if i < len(res) {
-				data := make([]map[string]string, 0, len(res[i]))
-				for _, r := range res[i] {
-					data = append(data, map[string]string{"resource": r})
-				}
-				consent["data"] = data
-			}
-			consents = append(consents, consent)
+		if malformed {
+			writeMalformed(w)
+			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{"consents": consents})
+		writeJSON(w, map[string]any{
+			"valid": validity.Valid, "consentId": validity.ConsentID, "reason": validity.Reason,
+			"checkedAt": "2026-11-02T08:00:00Z",
+		})
+	})
+
+	mux.HandleFunc("GET /v1/consents/{id}", func(w http.ResponseWriter, r *http.Request) {
+		m.mu.Lock()
+		m.readCalls++
+		m.record(r)
+		m.lastReadQuery = r.URL.Query()
+		record, found := m.byID[r.PathValue("id")]
+		status, malformed := m.readStatus, m.malformedRead
+		m.mu.Unlock()
+		switch {
+		case status != 0:
+			w.WriteHeader(status)
+		case malformed:
+			writeMalformed(w)
+		case !found:
+			w.WriteHeader(http.StatusNotFound)
+		default:
+			writeJSON(w, wireConsent(record))
+		}
 	})
 
 	srv := httptest.NewServer(mux)
@@ -187,38 +271,37 @@ func newMockCM(t *testing.T, m *mockCM) *httptest.Server {
 	return srv
 }
 
+// writeMalformed answers 200 with a body that does not decode as JSON.
+func writeMalformed(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write([]byte(malformedJSONBody))
+}
+
+// grantingMock serves grantedConsent in both modes.
+func grantingMock() *mockCM {
+	return &mockCM{
+		selfDescriptionURL: "http://facade/participants/provider",
+		consents:           []consentRecord{grantedConsent()},
+		validity:           consentValidity{Valid: true, ConsentID: testConsentID},
+		byID:               map[string]consentRecord{testConsentID: grantedConsent()},
+	}
+}
+
+// staticClient is a client with a static token, so only /me precedes a check.
+func staticClient(srvURL string) *Client {
+	return NewClient(ClientConfig{BaseURL: srvURL, ParticipantToken: "static-token", ProviderSD: "http://facade/sd"})
+}
+
+// tokenServiceClient fetches its token from the mock's token service.
+func tokenServiceClient(srvURL string) *Client {
+	return NewClient(ClientConfig{BaseURL: srvURL, TokenServiceURL: srvURL + tokenServicePath, TokenAudience: testAudience})
+}
+
+// bothModes are the modes every mode-independent behaviour is checked in.
+var bothModes = []Mode{ModeList, ModeCheck}
+
 // resetCredCache clears the package-wide caches between tests.
 func resetCredCache() { ResetCaches() }
-
-// TestCheckConsent_ResourceScoped verifies the (owner × dataResource) check: a
-// granted consent authorizes only the resources it covers, while an empty
-// DataResource is owner-level (any granted consent counts).
-func TestCheckConsent_ResourceScoped(t *testing.T) {
-	resetCredCache()
-	m := &mockCM{
-		userID:              "uid-1",
-		selfDescriptionURL:  "http://provider/sd",
-		statuses:            []string{"granted"},
-		resourcesPerConsent: [][]string{{"urn:ngsi-ld:PersonalProfile:alice"}},
-	}
-	srv := newMockCM(t, m)
-	c := NewClient(ClientConfig{BaseURL: srv.URL, TokenServiceURL: srv.URL + tokenServicePath, TokenAudience: testAudience})
-
-	// resource covered by a granted consent -> allow
-	resp, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: "alice-42", Consumer: testConsumerSD, DataResource: "urn:ngsi-ld:PersonalProfile:alice"})
-	require.NoError(t, err)
-	assert.Equal(t, DecisionAllow, resp.Decision)
-
-	// a different resource -> deny (the consent does not cover it)
-	resp, err = c.CheckConsent(context.Background(), ConsentRequest{Subject: "alice-42", Consumer: testConsumerSD, DataResource: "urn:ngsi-ld:PersonalProfile:bob"})
-	require.NoError(t, err)
-	assert.Equal(t, DecisionDeny, resp.Decision)
-
-	// owner-level (no resource) -> allow on any granted consent
-	resp, err = c.CheckConsent(context.Background(), ConsentRequest{Subject: "alice-42", Consumer: testConsumerSD})
-	require.NoError(t, err)
-	assert.Equal(t, DecisionAllow, resp.Decision)
-}
 
 // TestNewClient verifies the constructor applies defaults and stores parameters.
 func TestNewClient(t *testing.T) {
@@ -234,124 +317,458 @@ func TestNewClient(t *testing.T) {
 	assert.Equal(t, 1234*time.Millisecond, c2.httpClient.Timeout)
 }
 
-// TestCheckConsent covers the two-call decision matrix using a static token + SD
-// (no login/me involved).
-func TestCheckConsent(t *testing.T) {
-	const (
-		subject = "did:key:zSubject"
-		provSD  = "http://consent-facade:8080/participants/org-1"
-		uid     = "6a71e3567917ddaef2e2c866"
-	)
+// TestMatchConsent pins every leg of the matcher both modes share.
+func TestMatchConsent(t *testing.T) {
 	tests := []struct {
-		name            string
-		userID          string
-		statuses        []string
-		consentConsumer string // consumer the mock's consents were granted to
-		requestConsumer string // consumer the check is made for
-		wantDecision    Decision
+		name   string
+		noSelf bool
+		req    func(*ConsentRequest)
+		record func(*consentRecord)
+		want   bool
 	}{
-		{name: "granted -> allow", userID: uid, statuses: []string{"granted"}, wantDecision: DecisionAllow},
-		{name: "one of many granted -> allow", userID: uid, statuses: []string{"revoked", "granted"}, wantDecision: DecisionAllow},
-		{name: "only revoked -> deny", userID: uid, statuses: []string{"revoked"}, wantDecision: DecisionDeny},
-		{name: "no consents -> deny", userID: uid, statuses: []string{}, wantDecision: DecisionDeny},
-		{name: "unknown subject (404) -> deny", userID: "", statuses: nil, wantDecision: DecisionDeny},
+		{name: "fully scoped match", want: true},
+		{name: "unscoped request matches on consumer and provider", want: true, req: func(r *ConsentRequest) {
+			r.ContractURI, r.PrivacyNoticeID, r.Purpose = "", "", ""
+		}},
+		{name: "one of several purposes", want: true, record: func(c *consentRecord) {
+			c.Purposes = []string{"Research.", testPurpose}
+		}},
+		{name: "data resource is never matched", want: true, req: func(r *ConsentRequest) {
+			r.DataResource = "urn:ngsi-ld:Trip:1"
+		}},
+		{name: "notice id ignored when the request has none", want: true, req: func(r *ConsentRequest) {
+			r.PrivacyNoticeID = ""
+		}, record: func(c *consentRecord) { c.PrivacyNoticeID = "11111111-2222-4333-8444-555555555555" }},
+		{name: "not consented", record: func(c *consentRecord) { c.Consented = false }},
 		{
-			name: "granted to another consumer -> deny", userID: uid, statuses: []string{"granted"},
-			consentConsumer: "http://catalog/participants/someone-else", wantDecision: DecisionDeny,
+			// This participant is the consumer of another provider's consent.
+			name: "wrong provider", req: func(r *ConsentRequest) { r.Consumer = testProviderDID },
+			record: func(c *consentRecord) { c.Provider, c.Consumer = "did:key:zOtherProvider", testProviderDID },
+		},
+		{name: "unknown self", noSelf: true},
+		{name: "wrong consumer", record: func(c *consentRecord) { c.Consumer = "did:key:zSomeoneElse" }},
+		{name: "consumer SD URL instead of DID", req: func(r *ConsentRequest) { r.Consumer = testConsumerSD }},
+		{
+			name: "no consumer on either side", req: func(r *ConsentRequest) { r.Consumer = "" },
+			record: func(c *consentRecord) { c.Consumer = "" },
+		},
+		{name: "wrong contract", record: func(c *consentRecord) { c.ContractURI = "https://catalog/contracts/other" }},
+		{name: "wrong notice id", record: func(c *consentRecord) {
+			c.PrivacyNoticeID = "11111111-2222-4333-8444-555555555555"
+		}},
+		{name: "wrong purpose", record: func(c *consentRecord) { c.Purposes = []string{"Research."} }},
+		{name: "purpose differs in case", req: func(r *ConsentRequest) { r.Purpose = strings.ToUpper(testPurpose) }},
+		{name: "no purposes on the consent", record: func(c *consentRecord) { c.Purposes = nil }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req, record, self := matchingRequest(ModeList), grantedConsent(), testProviderDID
+			if tt.req != nil {
+				tt.req(&req)
+			}
+			if tt.record != nil {
+				tt.record(&record)
+			}
+			if tt.noSelf {
+				self = ""
+			}
+			assert.Equal(t, tt.want, matchConsent(req, self, record))
+		})
+	}
+}
+
+// TestCheckConsent_ListMode covers GET /consents: query, paging and matching.
+func TestCheckConsent_ListMode(t *testing.T) {
+	otherConsumer := grantedConsent()
+	otherConsumer.Consumer = "did:key:zSomeoneElse"
+	// A consent in which this participant is the consumer of another provider.
+	asConsumer := grantedConsent()
+	asConsumer.Provider, asConsumer.Consumer = "did:key:zOtherProvider", testProviderDID
+
+	tests := []struct {
+		name          string
+		consents      []consentRecord
+		pageSize      int
+		req           func(*ConsentRequest)
+		wantDecision  Decision
+		wantListCalls int
+	}{
+		{name: "match", consents: []consentRecord{grantedConsent()}, wantDecision: DecisionAllow, wantListCalls: 1},
+		{name: "no consents", wantDecision: DecisionDeny, wantListCalls: 1},
+		{name: "granted to another consumer", consents: []consentRecord{otherConsumer}, wantDecision: DecisionDeny, wantListCalls: 1},
+		{
+			name: "this participant as consumer of another provider", consents: []consentRecord{asConsumer},
+			req: func(r *ConsentRequest) { r.Consumer = testProviderDID }, wantDecision: DecisionDeny, wantListCalls: 1,
 		},
 		{
-			name: "consent naming no consumer -> deny", userID: uid, statuses: []string{"granted"},
-			consentConsumer: "none", wantDecision: DecisionDeny,
+			name: "match on page 2", consents: []consentRecord{otherConsumer, grantedConsent()}, pageSize: 1,
+			wantDecision: DecisionAllow, wantListCalls: 2,
 		},
 		{
-			name: "no consumer in the request -> deny", userID: uid, statuses: []string{"granted"},
-			requestConsumer: "none", wantDecision: DecisionDeny,
+			name: "no match across pages", consents: []consentRecord{otherConsumer, otherConsumer}, pageSize: 1,
+			wantDecision: DecisionDeny, wantListCalls: 2,
+		},
+		{
+			name: "data categories do not block a resource-scoped request", consents: []consentRecord{grantedConsent()},
+			req: func(r *ConsentRequest) { r.DataResource = "urn:ngsi-ld:Trip:1" }, wantDecision: DecisionAllow, wantListCalls: 1,
+		},
+		{
+			name: "no notice id sends no notice filter", consents: []consentRecord{grantedConsent()},
+			req: func(r *ConsentRequest) { r.PrivacyNoticeID = "" }, wantDecision: DecisionAllow, wantListCalls: 1,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			resetCredCache()
-			m := &mockCM{userID: tt.userID, statuses: tt.statuses, consentConsumer: tt.consentConsumer}
+			m := &mockCM{consents: tt.consents, pageSize: tt.pageSize}
 			srv := newMockCM(t, m)
-			c := NewClient(ClientConfig{BaseURL: srv.URL, ParticipantToken: "static-token", ProviderSD: provSD})
-
-			requestConsumer := testConsumerSD
-			if tt.requestConsumer == "none" {
-				requestConsumer = ""
+			req := matchingRequest(ModeList)
+			if tt.req != nil {
+				tt.req(&req)
 			}
-			resp, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: subject, Consumer: requestConsumer})
+
+			resp, err := staticClient(srv.URL).CheckConsent(context.Background(), req)
 			require.NoError(t, err)
 			assert.Equal(t, tt.wantDecision, resp.Decision)
+			if tt.wantDecision == DecisionAllow {
+				assert.Equal(t, testConsentID, resp.ConsentID)
+			} else {
+				assert.Contains(t, resp.Reason, "no granted consent for consumer "+req.Consumer)
+			}
 
 			m.mu.Lock()
 			defer m.mu.Unlock()
-			assert.Equal(t, 0, m.tokenCalls, "static token must not call the token service")
-			if tt.requestConsumer == "none" {
-				assert.Equal(t, 0, m.meCalls, "a check without a consumer must not reach the consent-manager")
-				assert.Equal(t, 0, m.searchCalls, "a check without a consumer must not reach the consent-manager")
-				return
-			}
-			assert.Equal(t, 1, m.meCalls, "static SD still needs /me for this participant's identifier")
-			assert.Equal(t, provSD, m.lastSearchSD)
-			assert.Equal(t, subject, m.lastSearchEmail)
-			if tt.userID != "" {
-				assert.Equal(t, "Bearer static-token", m.lastConsentsAuth)
-			}
+			assert.Equal(t, tt.wantListCalls, m.listCalls)
+			assert.Equal(t, 0, m.checkCalls+m.readCalls, "list mode never calls check or read")
+			assert.Equal(t, testOwnerDID, m.lastQuery.Get(userIdentifierQueryParam))
+			assert.Equal(t, strconv.Itoa(consentListPageSize), m.lastQuery.Get(sizeQueryParam))
+			assert.Equal(t, strconv.Itoa(tt.wantListCalls-1), m.lastQuery.Get(pageQueryParam))
+			assert.Equal(t, req.PrivacyNoticeID, m.lastQuery.Get(privacyNoticeIDQueryParam))
+			assert.Equal(t, req.PrivacyNoticeID != "", m.lastQuery.Has(privacyNoticeIDQueryParam))
 		})
 	}
 }
 
-// TestCheckConsent_ClientCredentials verifies the full client-credentials flow:
-// login for a token, derive the provider SD from /me, then run the two calls.
-// TestCheckConsent_ConsumerNamedOnlyInRecipients is the shape the consent-manager
-// actually returns from `?receipt=true`: the consumer appears as a bare Mongo id in
-// `dataConsumer`, and the self-description URL the plugin holds appears only in
-// `recipients`. Matching on consumer/dataConsumer alone denies a perfectly valid
-// consent - which is what made step 4 of the demo answer 403 with a granted consent
-// in place.
-func TestCheckConsent_ConsumerNamedOnlyInRecipients(t *testing.T) {
-	const providerSD = "http://consent-facade:8080/participants/org-1"
+// TestCheckConsent_ListPageCap verifies paging stops at maxConsentListPages and
+// denies, even when a match would follow.
+func TestCheckConsent_ListPageCap(t *testing.T) {
 	resetCredCache()
-	m := &mockCM{
-		userID: "uid-1", selfDescriptionURL: providerSD, statuses: []string{"granted"},
-		consentUsesRecipients: true,
+	other := grantedConsent()
+	other.Consumer = "did:key:zSomeoneElse"
+	consents := make([]consentRecord, 0, maxConsentListPages+1)
+	for range maxConsentListPages {
+		consents = append(consents, other)
 	}
+	m := &mockCM{consents: append(consents, grantedConsent()), pageSize: 1}
 	srv := newMockCM(t, m)
-	c := NewClient(ClientConfig{BaseURL: srv.URL, ParticipantToken: "static", ProviderSD: providerSD})
 
-	resp, err := c.CheckConsent(context.Background(),
-		ConsentRequest{Subject: "alice-42", Consumer: testConsumerSD})
+	resp, err := staticClient(srv.URL).CheckConsent(context.Background(), matchingRequest(ModeList))
 	require.NoError(t, err)
-	assert.Equal(t, DecisionAllow, resp.Decision,
-		"a consent whose consumer is named in recipients must be honoured")
+	assert.Equal(t, DecisionDeny, resp.Decision)
+	assert.Contains(t, resp.Reason, fmt.Sprintf("in the first %d consent pages", maxConsentListPages))
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	assert.Equal(t, maxConsentListPages, m.listCalls)
 }
 
-// TestCheckConsent_RecipientsNameADifferentConsumer guards the other direction: the
-// recipients fallback must not authorise a participant the consent was not granted to.
-func TestCheckConsent_RecipientsNameADifferentConsumer(t *testing.T) {
-	const providerSD = "http://consent-facade:8080/participants/org-1"
-	resetCredCache()
-	m := &mockCM{
-		userID: "uid-1", selfDescriptionURL: providerSD, statuses: []string{"granted"},
-		consentUsesRecipients: true, consentConsumer: "http://consent-facade:8080/participants/someone-else",
+// TestCheckConsent_CheckMode covers GET /consents/check and the mandatory
+// consent read whose record must pass matchConsent.
+func TestCheckConsent_CheckMode(t *testing.T) {
+	tests := []struct {
+		name         string
+		validity     consentValidity
+		record       func(*consentRecord) // mutates the record the read returns
+		readMissing  bool
+		req          func(*ConsentRequest)
+		wantDecision Decision
+		wantReason   string
+		wantRead     bool
+	}{
+		{
+			name: "valid and matching", validity: consentValidity{Valid: true, ConsentID: testConsentID},
+			wantDecision: DecisionAllow, wantRead: true,
+		},
+		{
+			name: "valid, no purpose sent", validity: consentValidity{Valid: true, ConsentID: testConsentID},
+			req: func(r *ConsentRequest) { r.Purpose = "" }, wantDecision: DecisionAllow, wantRead: true,
+		},
+		{
+			name: "provider mismatch", validity: consentValidity{Valid: true, ConsentID: testConsentID},
+			record: func(c *consentRecord) { c.Provider = "did:key:zOtherProvider" }, wantDecision: DecisionDeny,
+			wantReason: "does not match", wantRead: true,
+		},
+		{
+			name: "consumer mismatch", validity: consentValidity{Valid: true, ConsentID: testConsentID},
+			record: func(c *consentRecord) { c.Consumer = "did:key:zSomeoneElse" }, wantDecision: DecisionDeny,
+			wantReason: "does not match", wantRead: true,
+		},
+		{
+			name: "contract mismatch", validity: consentValidity{Valid: true, ConsentID: testConsentID},
+			record: func(c *consentRecord) { c.ContractURI = "https://catalog/contracts/other" }, wantDecision: DecisionDeny,
+			wantReason: "does not match", wantRead: true,
+		},
+		{
+			name: "notice id mismatch", validity: consentValidity{Valid: true, ConsentID: testConsentID},
+			record:       func(c *consentRecord) { c.PrivacyNoticeID = "11111111-2222-4333-8444-555555555555" },
+			wantDecision: DecisionDeny, wantReason: "does not match", wantRead: true,
+		},
+		{
+			name: "not valid", validity: consentValidity{Valid: false, Reason: "No consent is in force for did:key:zOwner."},
+			wantDecision: DecisionDeny, wantReason: consentNotInForceReason,
+		},
+		{
+			name: "valid without consentId", validity: consentValidity{Valid: true},
+			wantDecision: DecisionDeny, wantReason: "no usable consentId",
+		},
+		{
+			name: "valid with a non-UUID consentId", validity: consentValidity{Valid: true, ConsentID: "../participants/me"},
+			wantDecision: DecisionDeny, wantReason: "no usable consentId",
+		},
+		{
+			name: "404 on the consent read", validity: consentValidity{Valid: true, ConsentID: testConsentID},
+			readMissing: true, wantDecision: DecisionDeny, wantReason: "not readable", wantRead: true,
+		},
 	}
-	srv := newMockCM(t, m)
-	c := NewClient(ClientConfig{BaseURL: srv.URL, ParticipantToken: "static", ProviderSD: providerSD})
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resetCredCache()
+			record := grantedConsent()
+			if tt.record != nil {
+				tt.record(&record)
+			}
+			m := &mockCM{validity: tt.validity, byID: map[string]consentRecord{testConsentID: record}}
+			if tt.readMissing {
+				m.byID = nil
+			}
+			srv := newMockCM(t, m)
+			req := matchingRequest(ModeCheck)
+			if tt.req != nil {
+				tt.req(&req)
+			}
 
-	resp, err := c.CheckConsent(context.Background(),
-		ConsentRequest{Subject: "alice-42", Consumer: testConsumerSD})
+			resp, err := staticClient(srv.URL).CheckConsent(context.Background(), req)
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantDecision, resp.Decision)
+			assert.Contains(t, resp.Reason, tt.wantReason)
+			if tt.validity.Reason != "" {
+				assert.NotContains(t, resp.Reason, tt.validity.Reason, "the server's free-text reason stays out of the verdict")
+			}
+			if tt.wantDecision == DecisionAllow {
+				assert.Equal(t, testConsentID, resp.ConsentID)
+			}
+
+			m.mu.Lock()
+			defer m.mu.Unlock()
+			assert.Equal(t, 1, m.checkCalls)
+			assert.Equal(t, 0, m.listCalls, "check mode never lists")
+			assert.Equal(t, testOwnerDID, m.lastQuery.Get(userIdentifierQueryParam))
+			assert.Equal(t, testNoticeID, m.lastQuery.Get(privacyNoticeIDQueryParam))
+			assert.Equal(t, req.Purpose, m.lastQuery.Get(purposeQueryParam))
+			assert.Equal(t, req.Purpose != "", m.lastQuery.Has(purposeQueryParam))
+			if !tt.wantRead {
+				assert.Equal(t, 0, m.readCalls, "no consent read without a usable consentId")
+				return
+			}
+			assert.Equal(t, 1, m.readCalls)
+			assert.Equal(t, url.Values{formatQueryParam: {consentFormatFull}}, m.lastReadQuery)
+		})
+	}
+}
+
+// TestCheckConsent_ZeroModeIsList verifies an unset Mode is list mode.
+func TestCheckConsent_ZeroModeIsList(t *testing.T) {
+	resetCredCache()
+	m := grantingMock()
+	srv := newMockCM(t, m)
+	req := matchingRequest(ModeList)
+	req.Mode = ""
+
+	resp, err := staticClient(srv.URL).CheckConsent(context.Background(), req)
 	require.NoError(t, err)
-	assert.Equal(t, DecisionDeny, resp.Decision,
-		"a consent granted to another participant is not authority for this one")
+	assert.Equal(t, DecisionAllow, resp.Decision)
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	assert.Equal(t, 1, m.listCalls)
+	assert.Zero(t, m.checkCalls)
+}
+
+// TestCheckConsent_RequestGuards verifies the requests that deny before any call.
+func TestCheckConsent_RequestGuards(t *testing.T) {
+	tests := []struct {
+		name       string
+		req        func(*ConsentRequest)
+		wantReason string
+	}{
+		{name: "no subject", req: func(r *ConsentRequest) { r.Subject = "" }, wantReason: "no subject"},
+		{name: "no consumer", req: func(r *ConsentRequest) { r.Consumer = "" }, wantReason: "no consuming participant"},
+		{name: "check mode without notice id", req: func(r *ConsentRequest) {
+			r.Mode, r.PrivacyNoticeID = ModeCheck, ""
+		}, wantReason: "needs a privacy notice id"},
+		{name: "non-UUID notice id", req: func(r *ConsentRequest) { r.PrivacyNoticeID = "notice-1" }, wantReason: "not a UUID"},
+		{name: "unknown mode", req: func(r *ConsentRequest) { r.Mode = "lsit" }, wantReason: "unknown consent check mode"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resetCredCache()
+			m := grantingMock()
+			srv := newMockCM(t, m)
+			req := matchingRequest(ModeList)
+			tt.req(&req)
+
+			resp, err := tokenServiceClient(srv.URL).CheckConsent(context.Background(), req)
+			require.NoError(t, err)
+			assert.Equal(t, DecisionDeny, resp.Decision)
+			assert.Contains(t, resp.Reason, tt.wantReason)
+
+			m.mu.Lock()
+			defer m.mu.Unlock()
+			assert.Zero(t, m.tokenCalls+m.meCalls+m.listCalls+m.checkCalls+m.readCalls, "a guarded request reaches nothing")
+		})
+	}
+}
+
+// TestCheckConsent_StatusMapping verifies, in both modes, how consent-endpoint
+// statuses map to a refresh, a final sentinel or a retryable error.
+func TestCheckConsent_StatusMapping(t *testing.T) {
+	tests := []struct {
+		name           string
+		failStatuses   []int
+		readStatus     int  // check mode only
+		malformedBody  bool // 200 with an undecodable body on the list/check endpoint
+		malformedRead  bool // check mode only
+		wantAllow      bool
+		wantSentinel   error
+		wantTokenCalls int
+	}{
+		{name: "401 then ok refreshes once", failStatuses: []int{http.StatusUnauthorized}, wantAllow: true, wantTokenCalls: 2},
+		{
+			name: "401 twice", failStatuses: []int{http.StatusUnauthorized, http.StatusUnauthorized},
+			wantSentinel: ErrConsentManagerAuth, wantTokenCalls: 2,
+		},
+		{name: "403", failStatuses: []int{http.StatusForbidden}, wantSentinel: ErrConsentManagerAuth, wantTokenCalls: 1},
+		{name: "400", failStatuses: []int{http.StatusBadRequest}, wantSentinel: ErrConsentManagerRejected, wantTokenCalls: 1},
+		{name: "404 on the endpoint", failStatuses: []int{http.StatusNotFound}, wantSentinel: ErrConsentManagerRejected, wantTokenCalls: 1},
+		{name: "429", failStatuses: []int{http.StatusTooManyRequests}, wantTokenCalls: 1},
+		{name: "500", failStatuses: []int{http.StatusInternalServerError}, wantTokenCalls: 1},
+		{name: "403 on the consent read", readStatus: http.StatusForbidden, wantSentinel: ErrConsentManagerAuth, wantTokenCalls: 1},
+		{name: "400 on the consent read", readStatus: http.StatusBadRequest, wantSentinel: ErrConsentManagerRejected, wantTokenCalls: 1},
+		{name: "500 on the consent read", readStatus: http.StatusInternalServerError, wantTokenCalls: 1},
+		{name: "malformed 200 body", malformedBody: true, wantTokenCalls: 1},
+		{name: "malformed 200 body on the consent read", malformedRead: true, wantTokenCalls: 1},
+	}
+	for _, mode := range bothModes {
+		for _, tt := range tests {
+			if (tt.readStatus != 0 || tt.malformedRead) && mode != ModeCheck {
+				continue
+			}
+			t.Run(string(mode)+"/"+tt.name, func(t *testing.T) {
+				resetCredCache()
+				m := grantingMock()
+				m.failStatuses, m.readStatus = tt.failStatuses, tt.readStatus
+				m.malformedBody, m.malformedRead = tt.malformedBody, tt.malformedRead
+				srv := newMockCM(t, m)
+
+				resp, err := tokenServiceClient(srv.URL).CheckConsent(context.Background(), matchingRequest(mode))
+
+				m.mu.Lock()
+				defer m.mu.Unlock()
+				assert.Equal(t, tt.wantTokenCalls, m.tokenCalls)
+				if tt.wantAllow {
+					require.NoError(t, err)
+					assert.Equal(t, DecisionAllow, resp.Decision)
+					assert.Equal(t, "Bearer token-2", m.lastAuth, "the retry uses the refreshed token")
+					return
+				}
+				require.Error(t, err)
+				if tt.wantSentinel != nil {
+					assert.ErrorIs(t, err, tt.wantSentinel)
+					return
+				}
+				assert.NotErrorIs(t, err, ErrConsentManagerAuth)
+				assert.NotErrorIs(t, err, ErrConsentManagerRejected)
+			})
+		}
+	}
+}
+
+// TestCheckConsent_Timeout verifies a slow consent-manager is a retryable error.
+func TestCheckConsent_Timeout(t *testing.T) {
+	const (
+		clientTimeoutMs = 50
+		serverDelay     = 200 * time.Millisecond
+	)
+	for _, mode := range bothModes {
+		t.Run(string(mode), func(t *testing.T) {
+			resetCredCache()
+			m := grantingMock()
+			m.delay = serverDelay
+			srv := newMockCM(t, m)
+			c := NewClient(ClientConfig{BaseURL: srv.URL, ParticipantToken: "static", ProviderSD: "sd", TimeoutMs: clientTimeoutMs})
+
+			_, err := c.CheckConsent(context.Background(), matchingRequest(mode))
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "HTTP request failed")
+			assert.NotErrorIs(t, err, ErrConsentManagerAuth)
+			assert.NotErrorIs(t, err, ErrConsentManagerRejected)
+		})
+	}
+}
+
+// TestCheckConsent_BearerOnly verifies every consent call carries the bearer
+// token and no legacy consent-key header.
+func TestCheckConsent_BearerOnly(t *testing.T) {
+	for _, mode := range bothModes {
+		t.Run(string(mode), func(t *testing.T) {
+			resetCredCache()
+			m := grantingMock()
+			srv := newMockCM(t, m)
+
+			resp, err := staticClient(srv.URL).CheckConsent(context.Background(), matchingRequest(mode))
+			require.NoError(t, err)
+			assert.Equal(t, DecisionAllow, resp.Decision)
+
+			m.mu.Lock()
+			defer m.mu.Unlock()
+			assert.Equal(t, "Bearer static-token", m.lastAuth)
+			assert.False(t, m.sawConsentKey)
+			assert.Equal(t, 0, m.tokenCalls, "static token must not call the token service")
+			assert.Equal(t, 1, m.meCalls, "static token still needs /me for this participant's identifier")
+		})
+	}
+}
+
+// TestCheckConsent_NotCached verifies a revocation takes effect on the next check.
+func TestCheckConsent_NotCached(t *testing.T) {
+	for _, mode := range bothModes {
+		t.Run(string(mode), func(t *testing.T) {
+			resetCredCache()
+			m := grantingMock()
+			srv := newMockCM(t, m)
+			c := staticClient(srv.URL)
+
+			resp, err := c.CheckConsent(context.Background(), matchingRequest(mode))
+			require.NoError(t, err)
+			require.Equal(t, DecisionAllow, resp.Decision)
+
+			m.mu.Lock()
+			m.consents, m.validity = nil, consentValidity{Valid: false, Reason: "revoked"}
+			m.mu.Unlock()
+
+			resp, err = c.CheckConsent(context.Background(), matchingRequest(mode))
+			require.NoError(t, err)
+			assert.Equal(t, DecisionDeny, resp.Decision)
+		})
+	}
 }
 
 func TestCheckConsent_TokenService(t *testing.T) {
 	resetCredCache()
-	m := &mockCM{userID: "uid-1", statuses: []string{"granted"}, selfDescriptionURL: "http://facade/participants/derived"}
+	m := grantingMock()
+	m.selfDescriptionURL = "http://facade/participants/derived"
 	srv := newMockCM(t, m)
-	c := NewClient(ClientConfig{BaseURL: srv.URL, TokenServiceURL: srv.URL + tokenServicePath, TokenAudience: testAudience})
 
-	resp, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: "did:key:z", Consumer: testConsumerSD})
+	resp, err := tokenServiceClient(srv.URL).CheckConsent(context.Background(), matchingRequest(ModeList))
 	require.NoError(t, err)
 	assert.Equal(t, DecisionAllow, resp.Decision)
 
@@ -360,20 +777,19 @@ func TestCheckConsent_TokenService(t *testing.T) {
 	assert.Equal(t, 1, m.tokenCalls)
 	assert.Equal(t, testAudience, m.lastTokenAudience)
 	assert.Equal(t, 1, m.meCalls)
-	assert.Equal(t, "http://facade/participants/derived", m.lastSearchSD, "SD derived from /me is used in the search")
-	assert.Equal(t, "Bearer token-1", m.lastConsentsAuth, "the fetched token is used on the consents call")
+	assert.Equal(t, "Bearer token-1", m.lastAuth, "the fetched token is used on the consents call")
 }
 
 // TestCheckConsent_TokenAndSDCached verifies the token and derived SD are cached
-// across calls (login + /me happen once).
+// across calls (token fetch + /me happen once), while consents are re-read.
 func TestCheckConsent_TokenAndSDCached(t *testing.T) {
 	resetCredCache()
-	m := &mockCM{userID: "uid-1", statuses: []string{"granted"}, selfDescriptionURL: "http://facade/participants/derived"}
+	m := grantingMock()
 	srv := newMockCM(t, m)
-	c := NewClient(ClientConfig{BaseURL: srv.URL, TokenServiceURL: srv.URL + tokenServicePath, TokenAudience: testAudience})
+	c := tokenServiceClient(srv.URL)
 
 	for i := 0; i < 3; i++ {
-		resp, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: "did:key:z", Consumer: testConsumerSD})
+		resp, err := c.CheckConsent(context.Background(), matchingRequest(ModeList))
 		require.NoError(t, err)
 		assert.Equal(t, DecisionAllow, resp.Decision)
 	}
@@ -381,74 +797,20 @@ func TestCheckConsent_TokenAndSDCached(t *testing.T) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	assert.Equal(t, 1, m.tokenCalls, "token should be cached across calls")
-	assert.Equal(t, 1, m.meCalls, "provider SD should be cached across calls")
-	assert.Equal(t, 3, m.consentsCalls)
+	assert.Equal(t, 1, m.meCalls, "/me should be cached across calls")
+	assert.Equal(t, 3, m.listCalls)
 }
 
-// TestCheckConsent_401RefreshRetry verifies a 401 on the consents call triggers a
-// re-login and a single retry.
-func TestCheckConsent_401RefreshRetry(t *testing.T) {
-	resetCredCache()
-	m := &mockCM{userID: "uid-1", statuses: []string{"granted"}, selfDescriptionURL: "http://facade/sd", failFirstConsents: true}
-	srv := newMockCM(t, m)
-	c := NewClient(ClientConfig{BaseURL: srv.URL, TokenServiceURL: srv.URL + tokenServicePath, TokenAudience: testAudience})
-
-	resp, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: "did:key:z", Consumer: testConsumerSD})
-	require.NoError(t, err)
-	assert.Equal(t, DecisionAllow, resp.Decision)
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	assert.Equal(t, 2, m.tokenCalls, "401 should force a token refresh")
-	assert.Equal(t, 2, m.consentsCalls, "the consents call should be retried once")
-	assert.Equal(t, "Bearer token-2", m.lastConsentsAuth, "the retry uses the refreshed token")
-}
-
-// TestCheckConsent_LoginFailure surfaces a login error.
+// TestCheckConsent_TokenServiceFailure surfaces a token service error.
 func TestCheckConsent_TokenServiceFailure(t *testing.T) {
 	resetCredCache()
-	m := &mockCM{userID: "uid-1", statuses: []string{"granted"}, tokenStatus: http.StatusNotFound}
+	m := grantingMock()
+	m.tokenStatus = http.StatusNotFound
 	srv := newMockCM(t, m)
-	c := NewClient(ClientConfig{BaseURL: srv.URL, TokenServiceURL: srv.URL + tokenServicePath, TokenAudience: testAudience})
 
-	_, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: "did:key:z", Consumer: testConsumerSD})
+	_, err := tokenServiceClient(srv.URL).CheckConsent(context.Background(), matchingRequest(ModeList))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "token service returned status 404")
-}
-
-// TestCheckConsent_ProviderSDOverride verifies an explicit provider_sd wins over
-// the SD from /me, which is still called for this participant's identifier.
-func TestCheckConsent_ProviderSDOverride(t *testing.T) {
-	resetCredCache()
-	m := &mockCM{userID: "uid-1", statuses: []string{"granted"}}
-	srv := newMockCM(t, m)
-	c := NewClient(ClientConfig{BaseURL: srv.URL, TokenServiceURL: srv.URL + tokenServicePath, TokenAudience: testAudience, ProviderSD: "http://facade/explicit"})
-
-	resp, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: "did:key:z", Consumer: testConsumerSD})
-	require.NoError(t, err)
-	assert.Equal(t, DecisionAllow, resp.Decision)
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	assert.Equal(t, 1, m.tokenCalls, "token still comes from the token service")
-	assert.Equal(t, 1, m.meCalls, "/me is called for the identifier even with provider_sd")
-	assert.Equal(t, "http://facade/explicit", m.lastSearchSD)
-}
-
-// TestCheckConsent_EmptySubject denies without contacting the consent-manager.
-func TestCheckConsent_EmptySubject(t *testing.T) {
-	resetCredCache()
-	m := &mockCM{userID: "uid", statuses: []string{"granted"}}
-	srv := newMockCM(t, m)
-	c := NewClient(ClientConfig{BaseURL: srv.URL, TokenServiceURL: srv.URL + tokenServicePath, TokenAudience: testAudience})
-
-	resp, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: "", Consumer: testConsumerSD})
-	require.NoError(t, err)
-	assert.Equal(t, DecisionDeny, resp.Decision)
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	assert.Equal(t, 0, m.tokenCalls)
-	assert.Equal(t, 0, m.searchCalls)
 }
 
 // TestCheckConsent_MissingTokenSource errors when neither a static token nor a
@@ -456,17 +818,17 @@ func TestCheckConsent_EmptySubject(t *testing.T) {
 func TestCheckConsent_MissingTokenSource(t *testing.T) {
 	resetCredCache()
 	c := NewClient(ClientConfig{BaseURL: "http://cm:3000"})
-	_, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: "did:key:z", Consumer: testConsumerSD})
+	_, err := c.CheckConsent(context.Background(), matchingRequest(ModeList))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no participant_token and no token_service_url")
 }
 
-// TestCheckConsent_ConcurrentLoginCoalesced verifies that concurrent first
-// requests for the same participant coalesce onto a single client-credentials
-// login (no stampede) and a single /me fetch, rather than one per goroutine.
+// TestCheckConsent_ConcurrentTokenFetchCoalesced verifies that concurrent first
+// requests for the same participant coalesce onto a single token fetch (no
+// stampede) and a single /me fetch, rather than one per goroutine.
 func TestCheckConsent_ConcurrentTokenFetchCoalesced(t *testing.T) {
 	resetCredCache()
-	m := &mockCM{userID: "uid-1", statuses: []string{"granted"}, selfDescriptionURL: "sd"}
+	m := grantingMock()
 	srv := newMockCM(t, m)
 
 	const n = 20
@@ -476,9 +838,8 @@ func TestCheckConsent_ConcurrentTokenFetchCoalesced(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			// Same base URL + client id => same cache key, so the login must coalesce.
-			c := NewClient(ClientConfig{BaseURL: srv.URL, TokenServiceURL: srv.URL + tokenServicePath, TokenAudience: testAudience})
-			resp, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: "did:key:z", Consumer: testConsumerSD})
+			// Same base URL + token service => same cache key, so the fetch must coalesce.
+			resp, err := tokenServiceClient(srv.URL).CheckConsent(context.Background(), matchingRequest(ModeList))
 			if err != nil {
 				errs <- err
 			} else if resp.Decision != DecisionAllow {
@@ -495,14 +856,14 @@ func TestCheckConsent_ConcurrentTokenFetchCoalesced(t *testing.T) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	assert.Equal(t, 1, m.tokenCalls, "concurrent first requests must coalesce onto one token fetch")
-	assert.Equal(t, 1, m.meCalls, "provider SD should be fetched once and cached")
+	assert.Equal(t, 1, m.meCalls, "/me should be fetched once and cached")
 }
 
 // TestCheckConsentTransportFailure verifies an unreachable consent-manager errors.
 func TestCheckConsentTransportFailure(t *testing.T) {
 	resetCredCache()
 	c := NewClient(ClientConfig{BaseURL: "http://localhost:1", ParticipantToken: "t", ProviderSD: "sd", TimeoutMs: MinTimeoutMs})
-	_, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: "did:key:z", Consumer: testConsumerSD})
+	_, err := c.CheckConsent(context.Background(), matchingRequest(ModeList))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "HTTP request failed")
 }
@@ -517,7 +878,7 @@ func TestCheckConsentContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	c := NewClient(ClientConfig{BaseURL: srv.URL, ParticipantToken: "t", ProviderSD: "sd"})
-	_, err := c.CheckConsent(ctx, ConsentRequest{Subject: "did:key:z", Consumer: testConsumerSD})
+	_, err := c.CheckConsent(ctx, matchingRequest(ModeList))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "HTTP request failed")
 }
@@ -580,20 +941,11 @@ func TestCheckConsent_SeparateTokenServicesDoNotShareToken(t *testing.T) {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/participants/me", func(w http.ResponseWriter, _ *http.Request) { writeMe(w, "") })
-	mux.HandleFunc("/v1/users/identifier/search", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{"userIdentifier": "uid-1"})
-	})
-	mux.HandleFunc("/v1/consents/participants/", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v1/consents", func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		consentsAuth = append(consentsAuth, r.Header.Get("Authorization"))
 		mu.Unlock()
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"consents": []map[string]interface{}{
-				{"status": grantedStatus, "consumer": map[string]string{"selfDescriptionURL": testConsumerSD}},
-			},
-		})
+		writeJSON(w, map[string]any{"content": []map[string]any{wireConsent(grantedConsent())}, "totalPages": 1})
 	})
 	consentManager := httptest.NewServer(mux)
 	t.Cleanup(consentManager.Close)
@@ -601,10 +953,7 @@ func TestCheckConsent_SeparateTokenServicesDoNotShareToken(t *testing.T) {
 	// One token service per participant, each minting a distinguishable token.
 	newTokenService := func(token string) *httptest.Server {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{
-				"access_token": token, "token_type": "Bearer", "expires_in": 3600,
-			})
+			writeJSON(w, map[string]any{"access_token": token, "token_type": "Bearer", "expires_in": 3600})
 		}))
 		t.Cleanup(srv.Close)
 		return srv
@@ -617,7 +966,7 @@ func TestCheckConsent_SeparateTokenServicesDoNotShareToken(t *testing.T) {
 			TokenServiceURL: newTokenService(token).URL,
 			TokenAudience:   testAudience,
 		})
-		resp, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: "did:key:z", Consumer: testConsumerSD})
+		resp, err := c.CheckConsent(context.Background(), matchingRequest(ModeList))
 		require.NoError(t, err)
 		require.Equal(t, DecisionAllow, resp.Decision)
 	}
@@ -944,119 +1293,6 @@ func TestStatusError(t *testing.T) {
 	}
 }
 
-// TestResolveUserIdentifier_MemoisedPerSubject verifies the subject ->
-// userIdentifier mapping is reused, so one response resolving to the same owner
-// under several data resources searches once instead of once per resource.
-func TestResolveUserIdentifier_MemoisedPerSubject(t *testing.T) {
-	resetCredCache()
-	m := &mockCM{userID: "uid-1", statuses: []string{"granted"}, resourcesPerConsent: [][]string{{"r1", "r2"}}}
-	srv := newMockCM(t, m)
-	c := NewClient(ClientConfig{BaseURL: srv.URL, ParticipantToken: "static", ProviderSD: "sd"})
-
-	for _, resource := range []string{"r1", "r2"} {
-		resp, err := c.CheckConsent(context.Background(),
-			ConsentRequest{Subject: "did:key:zOwner", Consumer: testConsumerSD, DataResource: resource})
-		require.NoError(t, err)
-		assert.Equal(t, DecisionAllow, resp.Decision)
-	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	assert.Equal(t, 1, m.searchCalls, "the same owner must be resolved to an identifier once")
-	assert.Equal(t, 2, m.consentsCalls, "each resource still needs its own consent decision")
-}
-
-// TestResolveUserIdentifier_UnknownSubjectNotCached verifies an unknown subject
-// is re-asked every time. A data subject can register at any moment, and
-// remembering that they were unknown would keep denying them after they had
-// consented.
-func TestResolveUserIdentifier_UnknownSubjectNotCached(t *testing.T) {
-	resetCredCache()
-	m := &mockCM{userID: "", statuses: nil}
-	srv := newMockCM(t, m)
-	c := NewClient(ClientConfig{BaseURL: srv.URL, ParticipantToken: "static", ProviderSD: "sd"})
-
-	for i := 0; i < 3; i++ {
-		resp, err := c.CheckConsent(context.Background(),
-			ConsentRequest{Subject: "did:key:zStranger", Consumer: testConsumerSD})
-		require.NoError(t, err)
-		assert.Equal(t, DecisionDeny, resp.Decision)
-	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	assert.Equal(t, 3, m.searchCalls, "an unknown subject must not be cached as unknown")
-}
-
-// TestCheckConsent_PurposeScoped verifies the purpose leg of the consumer /
-// purpose / resource match. It is load-bearing once the resolver names a
-// purpose: a consent granted for "insurance quote" must not authorise a release
-// for research.
-func TestCheckConsent_PurposeScoped(t *testing.T) {
-	const (
-		grantedPurpose = "insurance-quote"
-		otherPurpose   = "research"
-	)
-
-	tests := []struct {
-		name            string
-		consentPurposes []string
-		requestPurpose  string
-		wantDecision    Decision
-	}{
-		{
-			name:            "matching purpose allows",
-			consentPurposes: []string{grantedPurpose},
-			requestPurpose:  grantedPurpose,
-			wantDecision:    DecisionAllow,
-		},
-		{
-			name:            "a different purpose denies",
-			consentPurposes: []string{grantedPurpose},
-			requestPurpose:  otherPurpose,
-			wantDecision:    DecisionDeny,
-		},
-		{
-			name:            "one of several purposes matching allows",
-			consentPurposes: []string{otherPurpose, grantedPurpose},
-			requestPurpose:  grantedPurpose,
-			wantDecision:    DecisionAllow,
-		},
-		{
-			name:            "a consent covering no purpose denies a purpose-scoped check",
-			consentPurposes: nil,
-			requestPurpose:  grantedPurpose,
-			wantDecision:    DecisionDeny,
-		},
-		{
-			// The caller could not determine a purpose, so it is not part of the
-			// match; the consumer match still applies.
-			name:            "no requested purpose leaves the check unscoped",
-			consentPurposes: []string{grantedPurpose},
-			requestPurpose:  "",
-			wantDecision:    DecisionAllow,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			resetCredCache()
-			m := &mockCM{userID: "uid-1", statuses: []string{"granted"}, consentPurposes: tt.consentPurposes}
-			srv := newMockCM(t, m)
-			c := NewClient(ClientConfig{BaseURL: srv.URL, ParticipantToken: "static", ProviderSD: "sd"})
-
-			resp, err := c.CheckConsent(context.Background(), ConsentRequest{
-				Subject: "did:key:zOwner", Consumer: testConsumerSD, Purpose: tt.requestPurpose,
-			})
-			require.NoError(t, err)
-			assert.Equal(t, tt.wantDecision, resp.Decision)
-			if tt.wantDecision == DecisionDeny {
-				assert.Contains(t, resp.Reason, "no granted consent")
-			}
-		})
-	}
-}
-
 // TestFetchSelf_Failures covers GET /participants/me. It runs before any
 // consent check, so a failure here takes the whole exchange down — the branches,
 // and which of them fail_open may never release on, are worth pinning.
@@ -1190,7 +1426,7 @@ func TestCredentials_SelfIdentifier(t *testing.T) {
 // wins, and that a static token skips the token service but not /me.
 func TestProviderSelfDescription_StaticOverride(t *testing.T) {
 	resetCredCache()
-	m := &mockCM{userID: "uid-1", statuses: []string{"granted"}}
+	m := &mockCM{}
 	srv := newMockCM(t, m)
 	c := NewClient(ClientConfig{BaseURL: srv.URL, ParticipantToken: "static", ProviderSD: "http://catalog/participants/static"})
 

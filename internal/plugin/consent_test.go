@@ -187,26 +187,26 @@ func testReqKey(id uint32) string {
 
 // --- Consent-manager mock (the two endpoints the plugin calls) ---
 
-// newConsentManager starts a mock consent-manager. identifier-search returns
-// userID (or 404 when empty); participant-consents returns one consent per
-// entry in statuses.
-func newConsentManager(t *testing.T, userID string, statuses []string) *httptest.Server {
+// newConsentManager starts a mock consent-manager whose /consents list returns
+// one consent per entry in statuses, each naming testConsumerDID as consumer.
+func newConsentManager(t *testing.T, statuses []string) *httptest.Server {
 	t.Helper()
+	return newConsentListServer(func(*http.Request) []map[string]interface{} {
+		return consentsGrantedTo(testConsumerDID, statuses)
+	})
+}
+
+// newConsentListServer serves GET /v1/consents as a single ConsentPage built by
+// content, plus the participant endpoints every client configuration calls.
+func newConsentListServer(content func(*http.Request) []map[string]interface{}) *httptest.Server {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/users/identifier/search", func(w http.ResponseWriter, r *http.Request) {
-		if userID == "" {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
+	mux.HandleFunc("/v1/consents", func(w http.ResponseWriter, r *http.Request) {
+		records := content(r)
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{"userIdentifier": userID})
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"content": records, "page": 0, "size": len(records), "totalElements": len(records), "totalPages": 1,
+		})
 	})
-	mux.HandleFunc("/v1/consents/participants/", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{"consents": consentsGrantedTo(testConsumerSD, statuses)})
-	})
-	// The participant registry, used to translate the consumer DID from the token
-	// into the self-description URL a contract names its parties by.
 	registerParticipantEndpoints(mux)
 	return httptest.NewServer(mux)
 }
@@ -358,17 +358,19 @@ const testOwnerDID = "did:key:zOwner"
 const testConsumerDID = "did:key:zConsumer"
 
 // testConsumerSD is the self-description URL the participant registry maps
-// testConsumerDID to — the consumer every consent check is scoped to.
+// testConsumerDID to; only the resolver sees it, consents name the DID.
 const testConsumerSD = "http://catalog/participants/consumer"
 
-// consentsGrantedTo builds consent records with the given statuses, each granted
-// to the named consuming participant.
+// consentsGrantedTo builds consent records with the given statuses, each naming
+// this participant as provider and the given DID as consumer.
 func consentsGrantedTo(consumer string, statuses []string) []map[string]interface{} {
 	consents := make([]map[string]interface{}, 0, len(statuses))
 	for _, s := range statuses {
 		consents = append(consents, map[string]interface{}{
-			"status":   s,
-			"consumer": map[string]string{"selfDescriptionURL": consumer},
+			"status":    strings.ToUpper(s),
+			"consented": s == "granted",
+			"provider":  testProviderDID,
+			"consumer":  consumer,
 		})
 	}
 	return consents
@@ -391,22 +393,22 @@ func TestConsentFilter_ResponseFilter(t *testing.T) {
 		{
 			name:           "granted consent for the resolved owner passes the response through",
 			setupContext:   storeRequest,
-			consentServer:  func(t *testing.T) *httptest.Server { return newConsentManager(t, "uid-1", []string{"granted"}) },
+			consentServer:  func(t *testing.T) *httptest.Server { return newConsentManager(t, []string{"granted"}) },
 			resolverServer: func(t *testing.T) *httptest.Server { return newOwnerResolver(t, ownedBy(testOwnerDID)) },
 			wantNoWrite:    true,
 		},
 		{
 			name:              "no granted consent denies with the default response",
 			setupContext:      storeRequest,
-			consentServer:     func(t *testing.T) *httptest.Server { return newConsentManager(t, "uid-1", []string{"revoked"}) },
+			consentServer:     func(t *testing.T) *httptest.Server { return newConsentManager(t, []string{"revoked"}) },
 			resolverServer:    func(t *testing.T) *httptest.Server { return newOwnerResolver(t, ownedBy(testOwnerDID)) },
 			wantWrittenBody:   DefaultDenyResponseBody,
 			wantWrittenStatus: DefaultDenyStatusCode,
 		},
 		{
-			name:              "unknown owner (404 on search) denies",
+			name:              "owner without consents denies",
 			setupContext:      storeRequest,
-			consentServer:     func(t *testing.T) *httptest.Server { return newConsentManager(t, "", nil) },
+			consentServer:     func(t *testing.T) *httptest.Server { return newConsentManager(t, nil) },
 			resolverServer:    func(t *testing.T) *httptest.Server { return newOwnerResolver(t, ownedBy(testOwnerDID)) },
 			wantWrittenBody:   DefaultDenyResponseBody,
 			wantWrittenStatus: DefaultDenyStatusCode,
@@ -414,7 +416,7 @@ func TestConsentFilter_ResponseFilter(t *testing.T) {
 		{
 			name:           "deny uses the custom status code and body",
 			setupContext:   storeRequest,
-			consentServer:  func(t *testing.T) *httptest.Server { return newConsentManager(t, "uid-1", []string{"revoked"}) },
+			consentServer:  func(t *testing.T) *httptest.Server { return newConsentManager(t, []string{"revoked"}) },
 			resolverServer: func(t *testing.T) *httptest.Server { return newOwnerResolver(t, ownedBy(testOwnerDID)) },
 			configFn: func(cfg *Config) {
 				cfg.DenyStatusCode = 451
@@ -457,7 +459,7 @@ func TestConsentFilter_ResponseFilter(t *testing.T) {
 		{
 			name:              "one denying owner denies the whole response (deny_all)",
 			setupContext:      storeRequest,
-			consentServer:     func(t *testing.T) *httptest.Server { return newConsentManager(t, "uid-1", []string{"revoked"}) },
+			consentServer:     func(t *testing.T) *httptest.Server { return newConsentManager(t, []string{"revoked"}) },
 			resolverServer:    func(t *testing.T) *httptest.Server { return newOwnerResolver(t, ownedBy("did:key:zA", "did:key:zB")) },
 			wantWrittenBody:   DefaultDenyResponseBody,
 			wantWrittenStatus: DefaultDenyStatusCode,
@@ -637,7 +639,7 @@ const responseContentTypeJSON = "application/json"
 
 func TestConsentFilter_ResponseFilter_ContextCleanup(t *testing.T) {
 	clearContextStore()
-	server := newConsentManager(t, "uid-1", []string{"granted"})
+	server := newConsentManager(t, []string{"granted"})
 	defer server.Close()
 	resolver := newOwnerResolver(t, ownedBy(testOwnerDID))
 	defer resolver.Close()
@@ -654,7 +656,7 @@ func TestConsentFilter_ResponseFilter_ContextCleanup(t *testing.T) {
 
 func TestConsentFilter_ResponseFilter_DenySetsContentType(t *testing.T) {
 	clearContextStore()
-	server := newConsentManager(t, "uid-1", []string{"revoked"})
+	server := newConsentManager(t, []string{"revoked"})
 	defer server.Close()
 	resolver := newOwnerResolver(t, ownedBy(testOwnerDID))
 	defer resolver.Close()
@@ -677,19 +679,9 @@ func TestConsentFilter_ResponseFilter_DenySetsContentType(t *testing.T) {
 func TestResponseFilter_ConsentScopedToConsumer(t *testing.T) {
 	clearContextStore()
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/users/identifier/search", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{"userIdentifier": "uid-owner"})
+	server := newConsentListServer(func(*http.Request) []map[string]interface{} {
+		return consentsGrantedTo("did:key:zSomeoneElse", []string{"granted"})
 	})
-	mux.HandleFunc("/v1/consents/participants/", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"consents": consentsGrantedTo("http://catalog/participants/someone-else", []string{"granted"}),
-		})
-	})
-	registerParticipantEndpoints(mux)
-	server := httptest.NewServer(mux)
 	defer server.Close()
 
 	resolver := newOwnerResolver(t, ownedBy(testOwnerDID))
@@ -708,27 +700,17 @@ func TestResponseFilter_ConsentScopedToConsumer(t *testing.T) {
 // TestResponseFilter_OwnerNotRequestor is the regression test for the removed
 // legacy mode: the consent that decides access must be the RESOLVED OWNER's, not
 // the caller's. The resolver names Bob as the owner while the token's "sub" is
-// Alice; the identifier search must ask about Bob.
+// Alice; the consent lookup must ask about Bob.
 func TestResponseFilter_OwnerNotRequestor(t *testing.T) {
 	clearContextStore()
 
 	const owner = "did:key:zBob"
 	var searchedSubjects []string
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/users/identifier/search", func(w http.ResponseWriter, r *http.Request) {
-		var body map[string]string
-		_ = json.NewDecoder(r.Body).Decode(&body)
-		searchedSubjects = append(searchedSubjects, body["email"])
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{"userIdentifier": "uid-bob"})
+	server := newConsentListServer(func(r *http.Request) []map[string]interface{} {
+		searchedSubjects = append(searchedSubjects, r.URL.Query().Get("userIdentifier"))
+		return consentsGrantedTo(testConsumerDID, []string{"revoked"})
 	})
-	mux.HandleFunc("/v1/consents/participants/", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{"consents": consentsGrantedTo(testConsumerSD, []string{"revoked"})})
-	})
-	registerParticipantEndpoints(mux)
-	server := httptest.NewServer(mux)
 	defer server.Close()
 
 	resolver := newOwnerResolver(t, ownedBy(owner))
@@ -878,7 +860,7 @@ func TestDistinctClaims(t *testing.T) {
 // the upstream's.
 func TestDenyResponse_StripsUpstreamHeaders(t *testing.T) {
 	clearContextStore()
-	server := newConsentManager(t, "uid-1", []string{"revoked"})
+	server := newConsentManager(t, []string{"revoked"})
 	defer server.Close()
 	resolver := newOwnerResolver(t, ownedBy(testOwnerDID))
 	defer resolver.Close()
@@ -1152,7 +1134,7 @@ func TestClaimPathRoot(t *testing.T) {
 // path with an empty header diff.
 func TestResponseFilter_AllowDoesNotTouchHeaders(t *testing.T) {
 	clearContextStore()
-	server := newConsentManager(t, "uid-1", []string{"granted"})
+	server := newConsentManager(t, []string{"granted"})
 	defer server.Close()
 	resolver := newOwnerResolver(t, ownedBy(testOwnerDID))
 	defer resolver.Close()
@@ -1615,7 +1597,7 @@ func TestAuditReasonCarriesNoDependencyBody(t *testing.T) {
 		assert.NotContains(t, payload, leakedIdentifier,
 			"a dependency response body must not reach the audit sink through the reason")
 	}
-	assert.Contains(t, strings.Join(reasons, ""), "identifier search returned status 500",
+	assert.Contains(t, strings.Join(reasons, ""), "consents list returned status 500",
 		"the reason should classify the failure instead")
 }
 
