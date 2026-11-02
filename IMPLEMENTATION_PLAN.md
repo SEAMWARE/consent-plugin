@@ -165,6 +165,12 @@ Files: `internal/consent/client.go`, `internal/consent/client_test.go`,
     so without this check a departed consumer would reach the resolver and the consent check.
     The deny gets an explicit, logged reason and does not rest on the server refusing to
     deregister a participant with a GRANTED consent. Negative-cache it like "not found".
+  - The rule applies on a cache miss only. A DID that was cached as registered keeps passing
+    the registry gate until its positive entry expires (`participantSDCacheTTL`, 10 min).
+    This bounded window is accepted, not closed with a shorter TTL: the consent check still
+    runs on every request, uncached (decision 3), so the window only delays the explicit
+    "deregistered" reason and does not skip the consent decision. Keep the TTL constant's
+    GoDoc stating this window, and Step 6 documents it in the README.
   - Replace `participantListEntry`, `participantsResponse` and `decodeParticipants` with the
     new shape. Keep the positive and negative caches.
 - `fetchProviderSD` and `meResponse`: decode `Participant{identifier, selfDescriptionUri}`.
@@ -184,7 +190,10 @@ Files: `internal/consent/client.go`, `internal/consent/client_test.go`,
     and add table cases in `consent_test.go`.
 - Tests: a table for `statusError` (400, 401, 403, 404, 405, 422 → sentinel; 429, 500, 503 →
   plain error), table-driven registry cases (found, not found, missing SD, 401→refresh, 403,
-  404 from a wrong prefix, 429, 5xx, malformed JSON, `deregisteredAt` set → not registered), the `/participants/me` shape (including a missing `identifier`, and the
+  404 from a wrong prefix, 429, 5xx, malformed JSON, `deregisteredAt` set → not registered,
+  and a DID cached as registered that the registry now reports deregistered: still allowed
+  from cache before the positive TTL expires, `ErrParticipantNotRegistered` after it, using
+  an in-package test that backdates the entry's `expiry` in `participantSDCache`), the `/participants/me` shape (including a missing `identifier`, and the
   `/me` call still made with static token and `ProviderSD`), and the `failModeForError` mapping. Update
   `participantRegistryHandler` in the integration fakes to the new page shape, and make the
   `/v1/participants/me` fakes in `internal/plugin/consent_test.go` and the integration tests
@@ -343,6 +352,9 @@ Files: `dev/mocks/*.json`, `docker-compose.yaml`, `README.md`, `AGENTS.md`.
   - Rewrite "Participant authentication": the token needs the `PARTICIPANT` role and the
     participant-identifier claim, the `/participants/me` and `/participants?identifier=`
     shapes, and a cache key without host or consent key.
+  - State the registry cache windows: a deregistered consumer can still pass the registry
+    gate for up to `participantSDCacheTTL` (10 min) after deregistration if it was cached,
+    while the consent check itself is never cached.
   - Add a failure-mapping table (decision 4, including other 4xx → closed and 429 → policy).
   - Document contract scoping and `require_contract` next to `require_purpose`.
   - Recommend per-claim `contractUri` or `privacyNoticeId` from the resolver over a route-level
