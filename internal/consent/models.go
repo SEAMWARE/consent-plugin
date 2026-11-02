@@ -15,9 +15,9 @@
  * limitations under the License.
  */
 
-// Package consent provides an HTTP client for the external consent-manager,
-// which decides whether a data owner has granted the consuming participant
-// consent to access their personal data. The verdict is coarse — allow or deny
+// Package consent provides an HTTP client for the dsc-consent-manager, which
+// records whether a data owner has granted the consuming participant consent to
+// access their personal data. The verdict is coarse — allow or deny
 // for the whole response — and is enforced by the plugin's response phase.
 package consent
 
@@ -35,6 +35,19 @@ const (
 	DecisionDeny Decision = "deny"
 )
 
+// Mode selects how a ConsentRequest is checked against the consent-manager.
+type Mode string
+
+// Mode constants. ModeList is the zero value, so an unset Mode is list mode.
+const (
+	// ModeList pages through GET /consents?userIdentifier= and matches each record.
+	ModeList Mode = ""
+
+	// ModeCheck asks GET /consents/check and then reads the named consent to
+	// match it. It requires PrivacyNoticeID.
+	ModeCheck Mode = "check"
+)
+
 // ConsentRequest is one consent question: may this consumer be given this data
 // owner's data, for this purpose and resource?
 type ConsentRequest struct {
@@ -48,22 +61,31 @@ type ConsentRequest struct {
 	// Method is the HTTP method of the original request (e.g., "GET", "POST").
 	Method string `json:"method"`
 
-	// DataResource, when set, scopes the check: a granted consent counts only if
-	// it covers this resource (matched against the consent's data[].resource).
-	// Empty means owner-level (any granted consent counts).
+	// DataResource is the resource the owner was resolved for. It is recorded for
+	// audit only: a consent's data[] holds notice categories, not resource ids.
 	DataResource string `json:"data_resource,omitempty"`
 
+	// Mode selects list or check mode; the zero value is list mode.
+	Mode Mode `json:"mode,omitempty"`
+
+	// PrivacyNoticeID, when set, scopes the check to consents decided against
+	// this notice (a UUID). Check mode requires it.
+	PrivacyNoticeID string `json:"privacy_notice_id,omitempty"`
+
+	// ContractURI, when set, scopes the check to consents under this contract.
+	ContractURI string `json:"contract_uri,omitempty"`
+
 	// Consumer identifies the participant the data is being released TO, as its
-	// self-description URL. It is REQUIRED: a consent is an agreement between a
+	// participant identifier (DID). It is REQUIRED: a consent is an agreement between a
 	// data subject and one named consumer for one named purpose, so a check that
 	// ignores it would let participant Y ride on a consent the subject granted to
 	// participant X. A check without a consumer is denied.
 	Consumer string `json:"consumer,omitempty"`
 
-	// Purpose, when set, further scopes the check to the processing purpose (or
-	// contract) the exchange is governed by: a granted consent counts only if it
-	// covers this purpose. Empty means the purpose is not known — the consumer
-	// match still applies.
+	// Purpose, when set, further scopes the check to the processing purpose the
+	// exchange is governed by: a consent counts only if its purposes[] contains
+	// it verbatim. Empty means the purpose is not known — the consumer match
+	// still applies.
 	Purpose string `json:"purpose,omitempty"`
 }
 
@@ -75,4 +97,7 @@ type ConsentResponse struct {
 	// Reason is a human-readable explanation for the consent decision,
 	// recorded in the audit log and useful for debugging.
 	Reason string `json:"reason,omitempty"`
+
+	// ConsentID is the matched consent on an allow, so its receipt can be fetched later.
+	ConsentID string `json:"consent_id,omitempty"`
 }

@@ -175,40 +175,35 @@ func buildMockJWT(claims map[string]interface{}) string {
 	return fmt.Sprintf("%s.%s.nosig", header, payloadB64)
 }
 
-// newConsentManager starts a mock consent-manager exposing the two endpoints
-// the plugin calls. identifier-search returns userID (or 404 when empty) and,
-// when wantSubject is non-empty, asserts the forwarded subject ("email");
-// participant-consents returns one consent per entry in statuses.
-func newConsentManager(t *testing.T, wantSubject, userID string, statuses []string) *httptest.Server {
+// newConsentManager starts a mock consent-manager whose /consents list returns
+// one consent per entry in statuses and, when wantSubject is non-empty, asserts
+// it is the userIdentifier asked about.
+func newConsentManager(t *testing.T, wantSubject string, statuses []string) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
-
-	mux.HandleFunc("/v1/users/identifier/search", func(w http.ResponseWriter, r *http.Request) {
-		var body map[string]string
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			t.Errorf("failed to decode identifier search body: %v", err)
-		}
-		if wantSubject != "" {
-			assert.Equal(t, wantSubject, body["email"], "subject must be forwarded as the user email")
-		}
-		if userID == "" {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{"userIdentifier": userID})
-	})
-
-	mux.HandleFunc("/v1/consents/participants/", func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, "Bearer itest-participant-token", r.Header.Get("Authorization"),
-			"consents lookup must carry the participant token")
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{"consents": consentsGrantedTo(statuses)})
-	})
-
+	mux.HandleFunc("/v1/consents", consentListHandler(t, "Bearer itest-participant-token", wantSubject, statuses))
 	registerParticipantEndpoints(mux)
-
 	return httptest.NewServer(mux)
+}
+
+// consentListHandler serves GET /consents as one ConsentPage of consentsGrantedTo(statuses),
+// asserting the bearer token and, when set, the userIdentifier.
+func consentListHandler(t *testing.T, wantAuth, wantSubject string, statuses []string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, wantAuth, r.Header.Get("Authorization"), "consents lookup must carry the participant token")
+		if wantSubject != "" {
+			assert.Equal(t, wantSubject, r.URL.Query().Get("userIdentifier"), "the owner must be the userIdentifier")
+		}
+		writeConsentPage(w, consentsGrantedTo(statuses))
+	}
+}
+
+// writeConsentPage encodes records as a single-page ConsentPage.
+func writeConsentPage(w http.ResponseWriter, records []map[string]interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"content": records, "page": 0, "size": len(records), "totalElements": len(records), "totalPages": 1,
+	})
 }
 
 // --- OwnerResolver mock (the source of data ownership) ---
@@ -217,17 +212,19 @@ func newConsentManager(t *testing.T, wantSubject, userID string, statuses []stri
 const itestConsumerDID = "did:key:zConsumer"
 
 // itestConsumerSD is the self-description URL the participant registry maps
-// itestConsumerDID to — the consumer every consent check is scoped to.
+// itestConsumerDID to; only the resolver sees it, consents name the DID.
 const itestConsumerSD = "http://catalog/participants/consumer"
 
-// consentsGrantedTo builds consent records with the given statuses, each granted
-// to the consuming participant the tests act as.
+// consentsGrantedTo builds consent records with the given statuses, each naming
+// this participant as provider and the test consumer's DID as consumer.
 func consentsGrantedTo(statuses []string) []map[string]interface{} {
 	consents := make([]map[string]interface{}, 0, len(statuses))
 	for _, s := range statuses {
 		consents = append(consents, map[string]interface{}{
-			"status":   s,
-			"consumer": map[string]string{"selfDescriptionURL": itestConsumerSD},
+			"status":    strings.ToUpper(s),
+			"consented": s == "granted",
+			"provider":  itestProviderDID,
+			"consumer":  itestConsumerDID,
 		})
 	}
 	return consents
@@ -415,7 +412,7 @@ const defaultDenyBody = `{"error":"access denied by consent policy"}`
 // TestIntegration_GrantedConsentPassthrough verifies a granted consent lets the
 // response through unchanged.
 func TestIntegration_GrantedConsentPassthrough(t *testing.T) {
-	srv := newConsentManager(t, "did:key:zAlice", "uid-1", []string{"granted"})
+	srv := newConsentManager(t, "did:key:zAlice", []string{"granted"})
 	defer srv.Close()
 	resolver := newOwnerResolver(t, "did:key:zAlice")
 	defer resolver.Close()
@@ -430,7 +427,7 @@ func TestIntegration_GrantedConsentPassthrough(t *testing.T) {
 // TestIntegration_NoGrantedConsentDenied verifies a subject with only a revoked
 // consent is denied.
 func TestIntegration_NoGrantedConsentDenied(t *testing.T) {
-	srv := newConsentManager(t, "", "uid-1", []string{"revoked"})
+	srv := newConsentManager(t, "", []string{"revoked"})
 	defer srv.Close()
 	resolver := newOwnerResolver(t, "did:key:zAlice")
 	defer resolver.Close()
@@ -442,10 +439,10 @@ func TestIntegration_NoGrantedConsentDenied(t *testing.T) {
 	assert.Equal(t, defaultDenyBody, string(resp.writtenBody))
 }
 
-// TestIntegration_UnknownSubjectDenied verifies a subject unknown to the
-// consent-manager (404 on identifier search) is denied.
+// TestIntegration_UnknownSubjectDenied verifies an owner with no consents in the
+// consent-manager is denied.
 func TestIntegration_UnknownSubjectDenied(t *testing.T) {
-	srv := newConsentManager(t, "", "", nil)
+	srv := newConsentManager(t, "", nil)
 	defer srv.Close()
 	resolver := newOwnerResolver(t, "did:key:zStranger")
 	defer resolver.Close()
@@ -459,7 +456,7 @@ func TestIntegration_UnknownSubjectDenied(t *testing.T) {
 
 // TestIntegration_CustomDenyResponse verifies the configured deny status/body are used.
 func TestIntegration_CustomDenyResponse(t *testing.T) {
-	srv := newConsentManager(t, "", "uid-1", []string{"revoked"})
+	srv := newConsentManager(t, "", []string{"revoked"})
 	defer srv.Close()
 
 	resolver := newOwnerResolver(t, "did:key:zAlice")
@@ -519,7 +516,7 @@ func TestIntegration_ConsentManagerError_FailClosed(t *testing.T) {
 // TestIntegration_OwnerNotRequestor verifies the subject the consent-manager is
 // asked about is the RESOLVED DATA OWNER, not the caller (asserted in the mock).
 func TestIntegration_OwnerNotRequestor(t *testing.T) {
-	srv := newConsentManager(t, "did:key:zBob", "uid-bob", []string{"granted"})
+	srv := newConsentManager(t, "did:key:zBob", []string{"granted"})
 	defer srv.Close()
 	resolver := newOwnerResolver(t, "did:key:zBob")
 	defer resolver.Close()
@@ -535,7 +532,7 @@ func TestIntegration_OwnerNotRequestor(t *testing.T) {
 // TestIntegration_CustomJWTHeader verifies the plugin reads the JWT from a custom
 // header when configured (the resolved owner's consent is granted).
 func TestIntegration_CustomJWTHeader(t *testing.T) {
-	srv := newConsentManager(t, "custom-user", "uid-c", []string{"granted"})
+	srv := newConsentManager(t, "custom-user", []string{"granted"})
 	defer srv.Close()
 	resolver := newOwnerResolver(t, "custom-user")
 	defer resolver.Close()
@@ -557,7 +554,7 @@ func TestIntegration_CustomJWTHeader(t *testing.T) {
 // TestIntegration_ContextCleanupAfterCycle verifies the request context is
 // cleaned up after a full request-response cycle (no memory leak).
 func TestIntegration_ContextCleanupAfterCycle(t *testing.T) {
-	srv := newConsentManager(t, "", "uid-1", []string{"granted"})
+	srv := newConsentManager(t, "", []string{"granted"})
 	defer srv.Close()
 	resolver := newOwnerResolver(t, "did:key:zAlice")
 	defer resolver.Close()
@@ -570,9 +567,9 @@ func TestIntegration_ContextCleanupAfterCycle(t *testing.T) {
 		"request context should be deleted after the response cycle")
 }
 
-// newConsentManagerCC starts a mock consent-manager exposing all four endpoints
-// used by the client-credentials flow (login, me, identifier search, consents).
-func newConsentManagerTokenService(t *testing.T, wantSubject, userID, selfDescriptionURL string, statuses []string) *httptest.Server {
+// newConsentManagerTokenService starts a mock consent-manager that also serves the
+// token service, for the flow without a static participant token.
+func newConsentManagerTokenService(t *testing.T, wantSubject, selfDescriptionURL string, statuses []string) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
 
@@ -595,26 +592,7 @@ func newConsentManagerTokenService(t *testing.T, wantSubject, userID, selfDescri
 		_ = json.NewEncoder(w).Encode(map[string]string{"identifier": itestProviderDID, "selfDescriptionUri": selfDescriptionURL})
 	})
 
-	mux.HandleFunc("/v1/users/identifier/search", func(w http.ResponseWriter, r *http.Request) {
-		var b map[string]string
-		_ = json.NewDecoder(r.Body).Decode(&b)
-		if wantSubject != "" {
-			assert.Equal(t, wantSubject, b["email"])
-		}
-		assert.Equal(t, selfDescriptionURL, b["selfDescription"], "derived SD is used in the search")
-		if userID == "" {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{"userIdentifier": userID})
-	})
-
-	mux.HandleFunc("/v1/consents/participants/", func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, "Bearer itest-token", r.Header.Get("Authorization"))
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{"consents": consentsGrantedTo(statuses)})
-	})
+	mux.HandleFunc("/v1/consents", consentListHandler(t, "Bearer itest-token", wantSubject, statuses))
 
 	mux.HandleFunc("/v1/participants", participantRegistryHandler)
 
@@ -635,7 +613,7 @@ func tokenServiceConfig(consentURL, resolverURL string) map[string]interface{} {
 // token from the participant-local token service, derive the provider SD from
 // /me, then the two-call check.
 func TestIntegration_TokenServiceFlow(t *testing.T) {
-	srv := newConsentManagerTokenService(t, "did:key:zAlice", "uid-1",
+	srv := newConsentManagerTokenService(t, "did:key:zAlice",
 		"http://consent-facade:8080/participants/derived", []string{"granted"})
 	defer srv.Close()
 	resolver := newOwnerResolver(t, "did:key:zAlice")
@@ -650,7 +628,7 @@ func TestIntegration_TokenServiceFlow(t *testing.T) {
 // TestIntegration_TokenServiceDenied verifies a not-granted consent denies via
 // the OID4VP-token path.
 func TestIntegration_TokenServiceDenied(t *testing.T) {
-	srv := newConsentManagerTokenService(t, "", "uid-1",
+	srv := newConsentManagerTokenService(t, "",
 		"http://consent-facade:8080/participants/derived", []string{"revoked"})
 	defer srv.Close()
 	resolver := newOwnerResolver(t, "did:key:zAlice")
@@ -671,34 +649,19 @@ func TestIntegration_TokenServiceDenied(t *testing.T) {
 func perOwnerConsentManager(t *testing.T, statusByOwner map[string]string, asked *[]string) *httptest.Server {
 	t.Helper()
 	var mu sync.Mutex
-	identifiers := map[string]string{}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/users/identifier/search", func(w http.ResponseWriter, r *http.Request) {
-		var body map[string]string
-		_ = json.NewDecoder(r.Body).Decode(&body)
-		owner := body["email"]
+	mux.HandleFunc("/v1/consents", func(w http.ResponseWriter, r *http.Request) {
+		owner := r.URL.Query().Get("userIdentifier")
 		mu.Lock()
 		*asked = append(*asked, owner)
 		status, known := statusByOwner[owner]
+		mu.Unlock()
+		var records []map[string]interface{}
 		if known {
-			identifiers["uid-"+owner] = status
+			records = consentsGrantedTo([]string{status})
 		}
-		mu.Unlock()
-		if !known {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{"userIdentifier": "uid-" + owner})
-	})
-	mux.HandleFunc("/v1/consents/participants/", func(w http.ResponseWriter, r *http.Request) {
-		id := strings.TrimPrefix(r.URL.Path, "/v1/consents/participants/")
-		mu.Lock()
-		status := identifiers[id]
-		mu.Unlock()
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{"consents": consentsGrantedTo([]string{status})})
+		writeConsentPage(w, records)
 	})
 	registerParticipantEndpoints(mux)
 	srv := httptest.NewServer(mux)
