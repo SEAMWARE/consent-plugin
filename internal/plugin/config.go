@@ -396,6 +396,9 @@ func (c *Config) applyDefaults() {
 	if c.CheckMode == "" {
 		c.CheckMode = DefaultCheckMode
 	}
+	// The consent-manager serialises UUIDs in lowercase and notice ids are
+	// matched verbatim, so an uppercase route value would never match.
+	c.PrivacyNoticeID = strings.ToLower(c.PrivacyNoticeID)
 	if c.DenyStatusCode == 0 {
 		c.DenyStatusCode = DefaultDenyStatusCode
 	}
@@ -541,6 +544,7 @@ func ParseConfig(in []byte) (*Config, error) {
 	if err := json.Unmarshal(in, &conf); err != nil {
 		return nil, fmt.Errorf("config parsing: failed to unmarshal JSON: %w", err)
 	}
+	warnRemovedKeys(in)
 
 	conf.applyDefaults()
 	conf.applyEnv()
@@ -555,4 +559,21 @@ func ParseConfig(in []byte) (*Config, error) {
 	}
 
 	return &conf, nil
+}
+
+// removedConfigKeys are options dropped with the move to dsc-consent-manager.
+// json.Unmarshal ignores them silently, so ParseConfig warns instead.
+var removedConfigKeys = []string{"consent_api_host", "consent_key"}
+
+// warnRemovedKeys logs each removed option still present in the route config.
+func warnRemovedKeys(in []byte) {
+	var raw map[string]json.RawMessage
+	if json.Unmarshal(in, &raw) != nil {
+		return
+	}
+	for _, key := range removedConfigKeys {
+		if _, ok := raw[key]; ok {
+			logging.Warnf("config option %q was removed with the move to dsc-consent-manager and is ignored", key)
+		}
+	}
 }

@@ -19,6 +19,7 @@ package plugin
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -316,6 +317,20 @@ func TestParseConfig_ConsentLookupOptions(t *testing.T) {
 			name:      "check_mode is case-sensitive",
 			set:       map[string]interface{}{"check_mode": "LIST"},
 			errSubstr: "check_mode must be",
+		},
+		{
+			name: "uppercase privacy_notice_id is lowercased",
+			set:  map[string]interface{}{"privacy_notice_id": strings.ToUpper(testPrivacyNoticeID)},
+			check: func(t *testing.T, cfg *Config) {
+				assert.Equal(t, testPrivacyNoticeID, cfg.PrivacyNoticeID)
+			},
+		},
+		{
+			name: "removed Visions options still load",
+			set:  map[string]interface{}{"consent_api_host": "consent.example", "consent_key": "k"},
+			check: func(t *testing.T, cfg *Config) {
+				assert.Equal(t, CheckModeList, cfg.CheckMode)
+			},
 		},
 		{
 			name:      "malformed privacy_notice_id is rejected",
