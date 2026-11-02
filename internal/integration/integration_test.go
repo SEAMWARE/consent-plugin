@@ -16,8 +16,8 @@
  */
 
 // Package integration provides end-to-end integration tests for the
-// consent-filter plugin. Each test starts a mock consent API server,
-// creates a real plugin instance with configuration pointing to it,
+// consent-filter plugin. Each test starts a stateful dsc-consent-manager fake
+// and a mock OwnerResolver, creates a real plugin instance pointing at them,
 // and simulates the full RequestFilter → ResponseFilter lifecycle.
 package integration
 
@@ -28,13 +28,16 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	pkgHTTP "github.com/apache/apisix-go-plugin-runner/pkg/http"
@@ -175,100 +178,301 @@ func buildMockJWT(claims map[string]interface{}) string {
 	return fmt.Sprintf("%s.%s.nosig", header, payloadB64)
 }
 
-// newConsentManager starts a mock consent-manager whose /consents list returns
-// one consent per entry in statuses and, when wantSubject is non-empty, asserts
-// it is the userIdentifier asked about.
-func newConsentManager(t *testing.T, wantSubject string, statuses []string) *httptest.Server {
-	t.Helper()
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/consents", consentListHandler(t, "Bearer itest-participant-token", wantSubject, statuses))
-	registerParticipantEndpoints(mux)
-	return httptest.NewServer(mux)
+// --- dsc-consent-manager fake ---
+
+// Identities of the parties in the test scenario.
+const (
+	// itestConsumerDID is the consuming participant named in the access token.
+	itestConsumerDID = "did:key:zConsumer"
+	// itestConsumerSD is the self-description URI the registry maps itestConsumerDID
+	// to. Only the resolver sees it, because consents name the DID.
+	itestConsumerSD = "http://catalog/participants/consumer"
+	// itestProviderDID is the identifier /participants/me reports for this participant.
+	itestProviderDID = "did:key:zProvider"
+	// itestProviderSD is this participant's self-description URI.
+	itestProviderSD = "http://consent-facade:8080/participants/org-itest"
+	// itestOtherConsumerDID is a consumer the requests never come from.
+	itestOtherConsumerDID = "did:key:zOtherConsumer"
+	// itestOtherProviderDID is a provider other than this participant.
+	itestOtherProviderDID = "did:key:zOtherProvider"
+	// itestNoticeID is the privacy notice every granted consent is given under.
+	itestNoticeID = "3f2a6c1e-0b7d-4c8e-9a51-2d4e6f708192"
+	// itestCaller is the token's sub, which must never be taken as the data owner.
+	itestCaller = "did:key:zCaller"
+)
+
+// Wire values of the fake.
+const (
+	itestStaticToken  = "itest-participant-token"
+	itestFetchedToken = "itest-token"
+	tokenServicePath  = "/internal/tokens"
+	consentStatusOK   = "GRANTED"
+	consentRevoked    = "REVOKED"
+	// legacyConsentKeyHeader is the Visions consent key the plugin must no longer send.
+	legacyConsentKeyHeader = "x-visionstrust-consent-key"
+	// consentIDFmt renders the fake's sequence number as a UUID.
+	consentIDFmt = "00000000-0000-4000-8000-%012d"
+	// noticeCategory is the personal-data category a notice copies into data[].
+	noticeCategory = "Trip records"
+)
+
+// itestRegistry is the participant registry: DID -> self-description URI.
+var itestRegistry = map[string]string{
+	itestConsumerDID: itestConsumerSD,
+	itestProviderDID: itestProviderSD,
 }
 
-// consentListHandler serves GET /consents as one ConsentPage of consentsGrantedTo(statuses),
-// asserting the bearer token and, when set, the userIdentifier.
-func consentListHandler(t *testing.T, wantAuth, wantSubject string, statuses []string) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, wantAuth, r.Header.Get("Authorization"), "consents lookup must carry the participant token")
-		if wantSubject != "" {
-			assert.Equal(t, wantSubject, r.URL.Query().Get("userIdentifier"), "the owner must be the userIdentifier")
-		}
-		writeConsentPage(w, consentsGrantedTo(statuses))
+// dscConsent is one consent held by the fake.
+type dscConsent struct {
+	id, subject, noticeID, provider, consumer, status string
+	purposes                                          []string
+}
+
+// visible reports whether the caller (always this participant) is a party to c,
+// which is how the real server scopes every consent answer.
+func (c *dscConsent) visible() bool {
+	return c.provider == itestProviderDID || c.consumer == itestProviderDID
+}
+
+// record renders c as a dsc-consent-manager ConsentResponse.
+func (c *dscConsent) record() map[string]interface{} {
+	return map[string]interface{}{
+		"id":              c.id,
+		"privacyNoticeId": c.noticeID,
+		"status":          c.status,
+		"consented":       c.status == consentStatusOK,
+		"provider":        c.provider,
+		"consumer":        c.consumer,
+		"purposes":        c.purposes,
+		"data":            []string{noticeCategory},
 	}
 }
 
-// writeConsentPage encodes records as a single-page ConsentPage.
-func writeConsentPage(w http.ResponseWriter, records []map[string]interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+// consentOption adjusts a consent before the fake stores it.
+type consentOption func(*dscConsent)
+
+// toConsumer names did as the consent's consumer.
+func toConsumer(did string) consentOption { return func(c *dscConsent) { c.consumer = did } }
+
+// fromProvider names did as the consent's provider.
+func fromProvider(did string) consentOption { return func(c *dscConsent) { c.provider = did } }
+
+// dscConsentManager is a stateful fake of dsc-consent-manager /v1 whose consent
+// set tests mutate between plugin cycles. Every request it serves is checked
+// for the bearer token and for the absence of Visions-era headers.
+type dscConsentManager struct {
+	*httptest.Server
+	t        *testing.T
+	wantAuth string
+
+	mu         sync.Mutex
+	consents   []*dscConsent
+	asked      []string
+	failStatus int
+}
+
+// newDSCConsentManager starts the fake for a static participant token.
+func newDSCConsentManager(t *testing.T) *dscConsentManager {
+	return startDSCConsentManager(t, itestStaticToken, false)
+}
+
+// newDSCConsentManagerWithTokenService starts the fake with the consent-facade
+// token service served on the same address.
+func newDSCConsentManagerWithTokenService(t *testing.T) *dscConsentManager {
+	return startDSCConsentManager(t, itestFetchedToken, true)
+}
+
+func startDSCConsentManager(t *testing.T, token string, tokenService bool) *dscConsentManager {
+	t.Helper()
+	m := &dscConsentManager{t: t, wantAuth: "Bearer " + token}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/participants", m.serveRegistry)
+	mux.HandleFunc("GET /v1/participants/me", m.serveMe)
+	mux.HandleFunc("GET /v1/consents", m.serveList)
+	mux.HandleFunc("GET /v1/consents/check", m.serveCheck)
+	mux.HandleFunc("GET /v1/consents/{id}", m.serveRead)
+	if tokenService {
+		mux.HandleFunc("POST "+tokenServicePath, m.serveToken)
+	}
+	m.Server = httptest.NewServer(m.checkProtocol(mux))
+	t.Cleanup(m.Close)
+	return m
+}
+
+// checkProtocol asserts what every request must (not) carry: the bearer token
+// on the API, no Visions consent key and no Host rewrite.
+func (m *dscConsentManager) checkProtocol(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/v1/") {
+			assert.Equal(m.t, m.wantAuth, r.Header.Get("Authorization"), "%s must carry the participant token", r.URL.Path)
+		}
+		assert.Empty(m.t, r.Header.Get(legacyConsentKeyHeader), "%s must not carry the Visions consent key", r.URL.Path)
+		assert.Equal(m.t, m.Listener.Addr().String(), r.Host, "%s must not override Host", r.URL.Path)
+		next.ServeHTTP(w, r)
+	})
+}
+
+// grant stores a GRANTED consent of subject under itestNoticeID, from this
+// participant to itestConsumerDID unless opts say otherwise, and returns its id.
+func (m *dscConsentManager) grant(subject string, opts ...consentOption) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c := &dscConsent{
+		id:       fmt.Sprintf(consentIDFmt, len(m.consents)+1),
+		subject:  subject,
+		noticeID: itestNoticeID,
+		provider: itestProviderDID,
+		consumer: itestConsumerDID,
+		status:   consentStatusOK,
+	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	m.consents = append(m.consents, c)
+	return c.id
+}
+
+// revoke marks the consent id as REVOKED.
+func (m *dscConsentManager) revoke(id string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, c := range m.consents {
+		if c.id == id {
+			c.status = consentRevoked
+			return
+		}
+	}
+	m.t.Fatalf("revoke: unknown consent %s", id)
+}
+
+// failWith makes every consent endpoint answer status; the registry keeps working.
+func (m *dscConsentManager) failWith(status int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.failStatus = status
+}
+
+// askedSubjects returns the userIdentifiers the consent endpoints were asked about.
+func (m *dscConsentManager) askedSubjects() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return slices.Clone(m.asked)
+}
+
+// begin records subject and reports false once it has written the configured failure.
+func (m *dscConsentManager) begin(w http.ResponseWriter, subject string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if subject != "" {
+		m.asked = append(m.asked, subject)
+	}
+	if m.failStatus != 0 {
+		w.WriteHeader(m.failStatus)
+		return false
+	}
+	return true
+}
+
+func (m *dscConsentManager) serveRegistry(w http.ResponseWriter, r *http.Request) {
+	content := []map[string]string{}
+	did := r.URL.Query().Get("identifier")
+	if sd, ok := itestRegistry[did]; ok {
+		content = append(content, map[string]string{"identifier": did, "selfDescriptionUri": sd})
+	}
+	writeJSON(w, map[string]interface{}{"content": content})
+}
+
+func (m *dscConsentManager) serveMe(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, map[string]string{"identifier": itestProviderDID, "selfDescriptionUri": itestProviderSD})
+}
+
+func (m *dscConsentManager) serveToken(w http.ResponseWriter, r *http.Request) {
+	var b map[string]string
+	_ = json.NewDecoder(r.Body).Decode(&b)
+	assert.Equal(m.t, "consent-manager", b["audience"])
+	writeJSON(w, map[string]interface{}{"access_token": itestFetchedToken, "token_type": "Bearer", "expires_in": 3600})
+}
+
+// serveList answers GET /consents with the caller-visible consents of the
+// subject, filtered by status (default GRANTED) and, when given, the notice.
+func (m *dscConsentManager) serveList(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	subject := q.Get("userIdentifier")
+	if !m.begin(w, subject) {
+		return
+	}
+	status := q.Get("status")
+	if status == "" {
+		status = consentStatusOK
+	}
+	notice := q.Get("privacyNoticeId")
+
+	m.mu.Lock()
+	records := []map[string]interface{}{}
+	for _, c := range m.consents {
+		if c.subject == subject && c.status == status && (notice == "" || c.noticeID == notice) && c.visible() {
+			records = append(records, c.record())
+		}
+	}
+	m.mu.Unlock()
+	writeJSON(w, map[string]interface{}{
 		"content": records, "page": 0, "size": len(records), "totalElements": len(records), "totalPages": 1,
 	})
 }
 
-// --- OwnerResolver mock (the source of data ownership) ---
-
-// itestConsumerDID is the consuming participant named in the access token.
-const itestConsumerDID = "did:key:zConsumer"
-
-// itestConsumerSD is the self-description URL the participant registry maps
-// itestConsumerDID to; only the resolver sees it, consents name the DID.
-const itestConsumerSD = "http://catalog/participants/consumer"
-
-// consentsGrantedTo builds consent records with the given statuses, each naming
-// this participant as provider and the test consumer's DID as consumer.
-func consentsGrantedTo(statuses []string) []map[string]interface{} {
-	consents := make([]map[string]interface{}, 0, len(statuses))
-	for _, s := range statuses {
-		consents = append(consents, map[string]interface{}{
-			"status":    strings.ToUpper(s),
-			"consented": s == "granted",
-			"provider":  itestProviderDID,
-			"consumer":  itestConsumerDID,
-		})
+// serveCheck answers GET /consents/check. Like the real endpoint, it says
+// nothing about the consumer, so a valid answer alone must not release data.
+func (m *dscConsentManager) serveCheck(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	subject := q.Get("userIdentifier")
+	if !m.begin(w, subject) {
+		return
 	}
-	return consents
+	notice, purpose := q.Get("privacyNoticeId"), q.Get("purpose")
+	if notice == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	m.mu.Lock()
+	validity := map[string]interface{}{"valid": false, "reason": "no consent in force"}
+	for _, c := range m.consents {
+		if c.subject == subject && c.noticeID == notice && c.status == consentStatusOK && c.visible() &&
+			(purpose == "" || slices.Contains(c.purposes, purpose)) {
+			validity = map[string]interface{}{"valid": true, "consentId": c.id, "status": c.status}
+			break
+		}
+	}
+	m.mu.Unlock()
+	writeJSON(w, validity)
 }
 
-// itestProviderDID is the identifier /participants/me reports for this participant.
-const itestProviderDID = "did:key:zProvider"
+// serveRead answers GET /consents/{id}, with 404 when the caller is no party.
+func (m *dscConsentManager) serveRead(w http.ResponseWriter, r *http.Request) {
+	if !m.begin(w, "") {
+		return
+	}
+	assert.Equal(m.t, "full", r.URL.Query().Get("format"), "the consent read must ask for the full record")
+	id := r.PathValue("id")
 
-// registerParticipantEndpoints serves the participant registry and
-// /participants/me, which every client configuration now calls.
-func registerParticipantEndpoints(mux *http.ServeMux) {
-	mux.HandleFunc("/v1/participants", participantRegistryHandler)
-	mux.HandleFunc("/v1/participants/me", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{
-			"identifier": itestProviderDID, "selfDescriptionUri": "http://consent-facade:8080/participants/org-itest",
-		})
-	})
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, c := range m.consents {
+		if c.id == id && c.visible() {
+			writeJSON(w, c.record())
+			return
+		}
+	}
+	w.WriteHeader(http.StatusNotFound)
 }
 
-// participantRegistryHandler serves the consent-manager's participant registry,
-// which translates the consumer DID from the token into the self-description URI
-// a contract names its parties by.
-func participantRegistryHandler(w http.ResponseWriter, r *http.Request) {
-	content := []map[string]string{}
-	if r.URL.Query().Get("identifier") == itestConsumerDID {
-		content = append(content, map[string]string{"identifier": itestConsumerDID, "selfDescriptionUri": itestConsumerSD})
-	}
+// writeJSON encodes v as the JSON response body.
+func writeJSON(w http.ResponseWriter, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{"content": content})
+	_ = json.NewEncoder(w).Encode(v)
 }
 
-// newFailingConsentManager returns a consent-manager whose CONSENT CHECK calls
-// answer with the given status code (used to exercise the fail policy). The
-// participant registry still answers, so the failure under test is the check
-// itself and not the preceding contract lookup.
-func newFailingConsentManager(status int) *httptest.Server {
-	mux := http.NewServeMux()
-	registerParticipantEndpoints(mux)
-	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(status)
-	})
-	return httptest.NewServer(mux)
-}
+// --- OwnerResolver mock (the source of data ownership) ---
 
 // resolveEnvelope is the /resolve request the plugin sends, decoded so tests can
 // assert on what the resolver was actually told.
@@ -294,7 +498,7 @@ type resolveEnvelope struct {
 func newRecordingOwnerResolver(t *testing.T, reply map[string]interface{}, received *[]resolveEnvelope) *httptest.Server {
 	t.Helper()
 	var mu sync.Mutex
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var env resolveEnvelope
 		if err := json.NewDecoder(r.Body).Decode(&env); err != nil {
 			t.Errorf("failed to decode resolve request: %v", err)
@@ -302,42 +506,56 @@ func newRecordingOwnerResolver(t *testing.T, reply map[string]interface{}, recei
 		mu.Lock()
 		*received = append(*received, env)
 		mu.Unlock()
-		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(reply); err != nil {
-			t.Errorf("failed to encode resolve response: %v", err)
-		}
+		writeJSON(w, reply)
 	}))
+	t.Cleanup(srv.Close)
+	return srv
 }
 
 // newOwnerResolver starts a mock OwnerResolver that reports the given data
-// owners for every payload. With no owners, it reports that no consent is
-// required.
+// owners for every payload.
 func newOwnerResolver(t *testing.T, owners ...string) *httptest.Server {
 	t.Helper()
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		claims := make([]map[string]string, 0, len(owners))
-		for _, o := range owners {
-			claims = append(claims, map[string]string{"ownerId": o})
-		}
-		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(map[string]interface{}{
-			"consentRequired": len(owners) > 0,
-			"claims":          claims,
-		}); err != nil {
-			t.Errorf("failed to encode resolve response: %v", err)
-		}
-	}))
+	var received []resolveEnvelope
+	return newRecordingOwnerResolver(t, resolveReply(owners...), &received)
 }
 
-// baseConfig returns the minimal valid plugin configuration for the two-call
-// check, pointing at the given consent-manager and OwnerResolver.
-func baseConfig(consentURL, resolverURL string) map[string]interface{} {
-	return map[string]interface{}{
-		"consent_api_url":    consentURL,
-		"owner_resolver_url": resolverURL,
-		"participant_token":  "itest-participant-token",
-		"provider_sd":        "http://consent-facade:8080/participants/org-itest",
+// resolveReply builds a /resolve reply requiring consent from the given owners.
+func resolveReply(owners ...string) map[string]interface{} {
+	claims := make([]map[string]string, 0, len(owners))
+	for _, o := range owners {
+		claims = append(claims, map[string]string{"ownerId": o})
 	}
+	return map[string]interface{}{"consentRequired": true, "claims": claims}
+}
+
+// --- Plugin configuration and lifecycle ---
+
+// checkModes are the consent lookup modes every scenario runs in. Check mode
+// needs a notice id, which the route supplies here.
+var checkModes = []struct {
+	mode   string
+	config map[string]interface{}
+}{
+	{mode: plugin.CheckModeList, config: map[string]interface{}{"check_mode": plugin.CheckModeList}},
+	{mode: plugin.CheckModeCheck, config: map[string]interface{}{
+		"check_mode": plugin.CheckModeCheck, "privacy_notice_id": itestNoticeID,
+	}},
+}
+
+// baseConfig returns the minimal valid plugin configuration with a static
+// participant token, plus the given overrides.
+func baseConfig(consentURL, resolverURL string, overrides ...map[string]interface{}) map[string]interface{} {
+	cfg := map[string]interface{}{
+		"consent_api_url":    consentURL,
+		"owner_resolver_url": resolverURL + "/resolve",
+		"participant_token":  itestStaticToken,
+		"provider_sd":        itestProviderSD,
+	}
+	for _, o := range overrides {
+		maps.Copy(cfg, o)
+	}
+	return cfg
 }
 
 // marshalConfig serializes a config map to the JSON bytes APISIX would pass.
@@ -352,6 +570,12 @@ func marshalConfig(t *testing.T, cfg map[string]interface{}) []byte {
 // responses in the plugin lifecycle helper; personal-data responses are JSON.
 const responseContentTypeJSON = "application/json"
 
+// lastRequestID hands out request ids, so context-store entries never collide.
+var lastRequestID atomic.Uint32
+
+// nextRequestID returns a request id no other cycle in this package uses.
+func nextRequestID() uint32 { return lastRequestID.Add(1) }
+
 // runPluginCycle simulates the full APISIX plugin lifecycle: ParseConf, RequestFilter,
 // then ResponseFilter. Returns the mock response for assertion.
 func runPluginCycle(
@@ -364,16 +588,12 @@ func runPluginCycle(
 
 	p := &plugin.ConsentFilter{}
 
-	// ParseConf
 	conf, err := p.ParseConf(configJSON)
 	require.NoError(t, err, "ParseConf should succeed")
 
-	// RequestFilter — uses a no-op http.ResponseWriter since we don't
-	// expect the plugin to write during the request phase.
-	recorder := httptest.NewRecorder()
-	p.RequestFilter(conf, recorder, req)
+	// The plugin is not expected to write during the request phase.
+	p.RequestFilter(conf, httptest.NewRecorder(), req)
 
-	// Build the mock response with the same request ID.
 	respHeader := newMockResponseHeader()
 	respHeader.Set("Content-Type", responseContentTypeJSON)
 	resp := &mockResponse{
@@ -382,23 +602,27 @@ func runPluginCycle(
 		body:   responseBody,
 	}
 
-	// ResponseFilter
 	p.ResponseFilter(conf, resp)
 
 	return resp
 }
 
-// consentRequest builds a GET request for a personal-data entity. The token
-// names the CONSUMER (as the embedded credential's issuer) and its "sub"; neither
-// determines the data owner — the OwnerResolver does, from the response payload.
-func consentRequest(id uint32, caller string) *mockRequest {
+// consentRequest builds a GET request for a personal-data entity from
+// itestConsumerDID. The token's "sub" is itestCaller, which never determines the
+// data owner; the OwnerResolver does, from the response payload.
+func consentRequest() *mockRequest {
+	return consentRequestFrom(itestConsumerDID)
+}
+
+// consentRequestFrom is consentRequest with consumer as the credential issuer.
+func consentRequestFrom(consumer string) *mockRequest {
 	h := newMockRequestHeader()
 	h.Set("Authorization", "Bearer "+buildMockJWT(map[string]interface{}{
-		"sub":                  caller,
-		"verifiableCredential": map[string]interface{}{"issuer": itestConsumerDID},
+		"sub":                  itestCaller,
+		"verifiableCredential": map[string]interface{}{"issuer": consumer},
 	}))
 	return &mockRequest{
-		id:     id,
+		id:     nextRequestID(),
 		method: "GET",
 		path:   []byte("/ngsi-ld/v1/entities/urn:ngsi-ld:PersonalProfile:alice"),
 		header: h,
@@ -407,271 +631,229 @@ func consentRequest(id uint32, caller string) *mockRequest {
 
 const defaultDenyBody = `{"error":"access denied by consent policy"}`
 
-// --- Integration test cases (two-call consent check) ---
-
-// TestIntegration_GrantedConsentPassthrough verifies a granted consent lets the
-// response through unchanged.
-func TestIntegration_GrantedConsentPassthrough(t *testing.T) {
-	srv := newConsentManager(t, "did:key:zAlice", []string{"granted"})
-	defer srv.Close()
-	resolver := newOwnerResolver(t, "did:key:zAlice")
-	defer resolver.Close()
-
-	resp := runPluginCycle(t, marshalConfig(t, baseConfig(srv.URL, resolver.URL+"/resolve")),
-		consentRequest(1, "did:key:zCaller"), []byte(`{"email":"alice@example.org"}`))
-
-	assert.Nil(t, resp.writtenBody, "granted consent should not modify the response")
-	assert.Equal(t, 0, resp.writtenStatus)
+// assertAllowed asserts the response passed through untouched.
+func assertAllowed(t *testing.T, resp *mockResponse, msgAndArgs ...interface{}) {
+	t.Helper()
+	assert.Nil(t, resp.writtenBody, msgAndArgs...)
+	assert.Equal(t, 0, resp.writtenStatus, msgAndArgs...)
 }
 
-// TestIntegration_NoGrantedConsentDenied verifies a subject with only a revoked
-// consent is denied.
-func TestIntegration_NoGrantedConsentDenied(t *testing.T) {
-	srv := newConsentManager(t, "", []string{"revoked"})
-	defer srv.Close()
-	resolver := newOwnerResolver(t, "did:key:zAlice")
-	defer resolver.Close()
-
-	resp := runPluginCycle(t, marshalConfig(t, baseConfig(srv.URL, resolver.URL+"/resolve")),
-		consentRequest(2, "did:key:zCaller"), []byte(`{"email":"alice@example.org"}`))
-
-	assert.Equal(t, 403, resp.writtenStatus)
-	assert.Equal(t, defaultDenyBody, string(resp.writtenBody))
+// assertDenied asserts the response was replaced by the default deny.
+func assertDenied(t *testing.T, resp *mockResponse, msgAndArgs ...interface{}) {
+	t.Helper()
+	assert.Equal(t, http.StatusForbidden, resp.writtenStatus, msgAndArgs...)
+	assert.Equal(t, defaultDenyBody, string(resp.writtenBody), msgAndArgs...)
 }
 
-// TestIntegration_UnknownSubjectDenied verifies an owner with no consents in the
-// consent-manager is denied.
-func TestIntegration_UnknownSubjectDenied(t *testing.T) {
-	srv := newConsentManager(t, "", nil)
-	defer srv.Close()
-	resolver := newOwnerResolver(t, "did:key:zStranger")
-	defer resolver.Close()
+// --- Integration test cases ---
 
-	resp := runPluginCycle(t, marshalConfig(t, baseConfig(srv.URL, resolver.URL+"/resolve")),
-		consentRequest(3, "did:key:zCaller"), []byte(`{"email":"x@example.org"}`))
+// TestIntegration_ConsentLifecycle drives one owner through deny without
+// consent -> grant -> allow -> revoke -> deny against one fake, in each mode.
+// Consent answers are not cached, so each change takes effect on the next cycle.
+func TestIntegration_ConsentLifecycle(t *testing.T) {
+	const owner = "did:key:zAlice"
+	body := []byte(`{"email":"alice@example.org"}`)
 
-	assert.Equal(t, 403, resp.writtenStatus)
-	assert.Equal(t, defaultDenyBody, string(resp.writtenBody))
+	for _, mode := range checkModes {
+		t.Run(mode.mode, func(t *testing.T) {
+			consent.ResetCaches()
+			cm := newDSCConsentManager(t)
+			resolver := newOwnerResolver(t, owner)
+			cfg := marshalConfig(t, baseConfig(cm.URL, resolver.URL, mode.config))
+
+			assertDenied(t, runPluginCycle(t, cfg, consentRequest(), body), "no consent yet")
+
+			id := cm.grant(owner)
+			assertAllowed(t, runPluginCycle(t, cfg, consentRequest(), body), "after grant")
+
+			cm.revoke(id)
+			assertDenied(t, runPluginCycle(t, cfg, consentRequest(), body), "after revoke")
+
+			assert.Equal(t, []string{owner, owner, owner}, cm.askedSubjects(),
+				"the resolved owner, not the caller, must be the userIdentifier")
+		})
+	}
+}
+
+// TestIntegration_ConsentScoping verifies a consent of the right owner still
+// denies when it binds another consumer or another provider, in each mode. In
+// check mode the route-level notice id makes /consents/check answer valid, so
+// only the mandatory consent read can catch the mismatch.
+func TestIntegration_ConsentScoping(t *testing.T) {
+	const owner = "did:key:zAlice"
+
+	tests := []struct {
+		name       string
+		grant      []consentOption
+		consumer   string
+		wantDenied bool
+	}{
+		{name: "consent to this consumer allows", consumer: itestConsumerDID},
+		{
+			name:       "consent to another consumer denies",
+			grant:      []consentOption{toConsumer(itestOtherConsumerDID)},
+			consumer:   itestConsumerDID,
+			wantDenied: true,
+		},
+		{
+			// The request names this participant as consumer, and the owner's consent
+			// names it as consumer too, but of another provider's contract.
+			name:       "consent where this participant is the consumer of another provider denies",
+			grant:      []consentOption{fromProvider(itestOtherProviderDID), toConsumer(itestProviderDID)},
+			consumer:   itestProviderDID,
+			wantDenied: true,
+		},
+	}
+
+	for _, mode := range checkModes {
+		for _, tt := range tests {
+			t.Run(mode.mode+"/"+tt.name, func(t *testing.T) {
+				consent.ResetCaches()
+				cm := newDSCConsentManager(t)
+				cm.grant(owner, tt.grant...)
+				resolver := newOwnerResolver(t, owner)
+
+				resp := runPluginCycle(t, marshalConfig(t, baseConfig(cm.URL, resolver.URL, mode.config)),
+					consentRequestFrom(tt.consumer), []byte(`{"email":"alice@example.org"}`))
+
+				if tt.wantDenied {
+					assertDenied(t, resp)
+				} else {
+					assertAllowed(t, resp)
+				}
+			})
+		}
+	}
+}
+
+// TestIntegration_ConsentManagerFailure maps consent-manager failures to a
+// decision in each mode: retryable ones follow fail_open, auth errors and
+// permanent rejections deny even with it.
+func TestIntegration_ConsentManagerFailure(t *testing.T) {
+	const owner = "did:key:zAlice"
+
+	tests := []struct {
+		name       string
+		status     int
+		failOpen   bool
+		wantDenied bool
+	}{
+		{name: "5xx passes with fail_open", status: http.StatusInternalServerError, failOpen: true},
+		{name: "5xx denies fail-closed", status: http.StatusServiceUnavailable, wantDenied: true},
+		{name: "429 passes with fail_open", status: http.StatusTooManyRequests, failOpen: true},
+		{name: "401 denies even with fail_open", status: http.StatusUnauthorized, failOpen: true, wantDenied: true},
+		{name: "403 denies even with fail_open", status: http.StatusForbidden, failOpen: true, wantDenied: true},
+		{name: "400 denies even with fail_open", status: http.StatusBadRequest, failOpen: true, wantDenied: true},
+		{name: "404 denies even with fail_open", status: http.StatusNotFound, failOpen: true, wantDenied: true},
+	}
+
+	for _, mode := range checkModes {
+		for _, tt := range tests {
+			t.Run(mode.mode+"/"+tt.name, func(t *testing.T) {
+				consent.ResetCaches()
+				cm := newDSCConsentManager(t)
+				cm.grant(owner)
+				cm.failWith(tt.status)
+				resolver := newOwnerResolver(t, owner)
+
+				cfg := baseConfig(cm.URL, resolver.URL, mode.config, map[string]interface{}{"fail_open": tt.failOpen})
+				resp := runPluginCycle(t, marshalConfig(t, cfg), consentRequest(), []byte(`{"data":"x"}`))
+
+				if tt.wantDenied {
+					assertDenied(t, resp)
+				} else {
+					assertAllowed(t, resp, "fail_open should pass through a retryable error")
+				}
+			})
+		}
+	}
 }
 
 // TestIntegration_CustomDenyResponse verifies the configured deny status/body are used.
 func TestIntegration_CustomDenyResponse(t *testing.T) {
-	srv := newConsentManager(t, "", []string{"revoked"})
-	defer srv.Close()
-
+	consent.ResetCaches()
+	cm := newDSCConsentManager(t)
 	resolver := newOwnerResolver(t, "did:key:zAlice")
-	defer resolver.Close()
 
-	cfg := baseConfig(srv.URL, resolver.URL+"/resolve")
-	cfg["deny_status_code"] = 451
-	cfg["deny_response_body"] = `{"error":"legally restricted"}`
-	cfg["deny_response_content_type"] = "application/json"
+	cfg := baseConfig(cm.URL, resolver.URL, map[string]interface{}{
+		"deny_status_code":           http.StatusUnavailableForLegalReasons,
+		"deny_response_body":         `{"error":"legally restricted"}`,
+		"deny_response_content_type": "application/json",
+	})
 
-	resp := runPluginCycle(t, marshalConfig(t, cfg),
-		consentRequest(4, "did:key:zCaller"), []byte(`{"secret":"x"}`))
+	resp := runPluginCycle(t, marshalConfig(t, cfg), consentRequest(), []byte(`{"secret":"x"}`))
 
-	assert.Equal(t, 451, resp.writtenStatus)
+	assert.Equal(t, http.StatusUnavailableForLegalReasons, resp.writtenStatus)
 	assert.Equal(t, `{"error":"legally restricted"}`, string(resp.writtenBody))
 	assert.Equal(t, "application/json", resp.header.Get("Content-Type"))
-}
-
-// TestIntegration_ConsentManagerError_FailOpen verifies a consent-manager error
-// passes through when fail-open is set.
-func TestIntegration_ConsentManagerError_FailOpen(t *testing.T) {
-	srv := newFailingConsentManager(http.StatusInternalServerError)
-	defer srv.Close()
-
-	resolver := newOwnerResolver(t, "did:key:zAlice")
-	defer resolver.Close()
-
-	cfg := baseConfig(srv.URL, resolver.URL+"/resolve")
-	cfg["fail_open"] = true
-
-	resp := runPluginCycle(t, marshalConfig(t, cfg),
-		consentRequest(5, "did:key:zCaller"), []byte(`{"data":"passes"}`))
-
-	assert.Nil(t, resp.writtenBody, "fail-open should pass through on consent-manager error")
-	assert.Equal(t, 0, resp.writtenStatus)
-}
-
-// TestIntegration_ConsentManagerError_FailClosed verifies a consent-manager error
-// is denied when fail-closed.
-func TestIntegration_ConsentManagerError_FailClosed(t *testing.T) {
-	srv := newFailingConsentManager(http.StatusServiceUnavailable)
-	defer srv.Close()
-
-	resolver := newOwnerResolver(t, "did:key:zAlice")
-	defer resolver.Close()
-
-	cfg := baseConfig(srv.URL, resolver.URL+"/resolve")
-	cfg["fail_open"] = false
-
-	resp := runPluginCycle(t, marshalConfig(t, cfg),
-		consentRequest(6, "did:key:zCaller"), []byte(`{"data":"denied"}`))
-
-	assert.Equal(t, 403, resp.writtenStatus)
-	assert.Equal(t, defaultDenyBody, string(resp.writtenBody))
-}
-
-// TestIntegration_OwnerNotRequestor verifies the subject the consent-manager is
-// asked about is the RESOLVED DATA OWNER, not the caller (asserted in the mock).
-func TestIntegration_OwnerNotRequestor(t *testing.T) {
-	srv := newConsentManager(t, "did:key:zBob", []string{"granted"})
-	defer srv.Close()
-	resolver := newOwnerResolver(t, "did:key:zBob")
-	defer resolver.Close()
-
-	// The caller is Alice; the resolver says the data belongs to Bob, and the
-	// mock asserts that Bob — not Alice — is the subject sent to the search.
-	resp := runPluginCycle(t, marshalConfig(t, baseConfig(srv.URL, resolver.URL+"/resolve")),
-		consentRequest(7, "did:key:zAlice"), []byte(`{"ok":true}`))
-
-	assert.Nil(t, resp.writtenBody)
 }
 
 // TestIntegration_CustomJWTHeader verifies the plugin reads the JWT from a custom
 // header when configured (the resolved owner's consent is granted).
 func TestIntegration_CustomJWTHeader(t *testing.T) {
-	srv := newConsentManager(t, "custom-user", []string{"granted"})
-	defer srv.Close()
+	consent.ResetCaches()
+	cm := newDSCConsentManager(t)
+	cm.grant("custom-user")
 	resolver := newOwnerResolver(t, "custom-user")
-	defer resolver.Close()
 
-	cfg := baseConfig(srv.URL, resolver.URL+"/resolve")
-	cfg["jwt_header_name"] = "X-Auth-Token"
+	cfg := baseConfig(cm.URL, resolver.URL, map[string]interface{}{"jwt_header_name": "X-Auth-Token"})
 
 	h := newMockRequestHeader()
 	h.Set("X-Auth-Token", "Bearer "+buildMockJWT(map[string]interface{}{
 		"verifiableCredential": map[string]interface{}{"issuer": itestConsumerDID},
 	}))
-	req := &mockRequest{id: 8, method: "POST", path: []byte("/api/v1/items"), header: h}
+	req := &mockRequest{id: nextRequestID(), method: "POST", path: []byte("/api/v1/items"), header: h}
 
 	resp := runPluginCycle(t, marshalConfig(t, cfg), req, []byte(`{"created":true}`))
 
-	assert.Nil(t, resp.writtenBody, "granted consent via custom JWT header should pass through")
+	assertAllowed(t, resp, "granted consent via custom JWT header should pass through")
 }
 
 // TestIntegration_ContextCleanupAfterCycle verifies the request context is
 // cleaned up after a full request-response cycle (no memory leak).
 func TestIntegration_ContextCleanupAfterCycle(t *testing.T) {
-	srv := newConsentManager(t, "", []string{"granted"})
-	defer srv.Close()
+	consent.ResetCaches()
+	cm := newDSCConsentManager(t)
+	cm.grant("did:key:zAlice")
 	resolver := newOwnerResolver(t, "did:key:zAlice")
-	defer resolver.Close()
 
-	const id = uint32(999)
-	_ = runPluginCycle(t, marshalConfig(t, baseConfig(srv.URL, resolver.URL+"/resolve")),
-		consentRequest(id, "did:key:zCaller"), []byte(`{"data":"test"}`))
+	_ = runPluginCycle(t, marshalConfig(t, baseConfig(cm.URL, resolver.URL)),
+		consentRequest(), []byte(`{"data":"test"}`))
 
 	assert.Equal(t, 0, plugin.RequestContextStoreSize(),
 		"request context should be deleted after the response cycle")
 }
 
-// newConsentManagerTokenService starts a mock consent-manager that also serves the
-// token service, for the flow without a static participant token.
-func newConsentManagerTokenService(t *testing.T, wantSubject, selfDescriptionURL string, statuses []string) *httptest.Server {
-	t.Helper()
-	mux := http.NewServeMux()
+// TestIntegration_TokenServiceFlow drives the token-service path: fetch a token
+// by audience from the consent-facade, derive the provider identity from
+// /participants/me, then check the consent with the fetched token.
+func TestIntegration_TokenServiceFlow(t *testing.T) {
+	const owner = "did:key:zAlice"
 
-	// The participant-local token service (the consent-facade's /internal/tokens),
-	// served on the same test server for convenience. The plugin holds no
-	// participant credentials - it asks for a token by audience NAME.
-	mux.HandleFunc("/internal/tokens", func(w http.ResponseWriter, r *http.Request) {
-		var b map[string]string
-		_ = json.NewDecoder(r.Body).Decode(&b)
-		assert.Equal(t, "consent-manager", b["audience"])
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"access_token": "itest-token", "token_type": "Bearer", "expires_in": 3600,
+	for _, mode := range checkModes {
+		t.Run(mode.mode, func(t *testing.T) {
+			consent.ResetCaches()
+			cm := newDSCConsentManagerWithTokenService(t)
+			resolver := newOwnerResolver(t, owner)
+			cfg := maps.Clone(mode.config)
+			maps.Copy(cfg, map[string]interface{}{
+				"consent_api_url":    cm.URL,
+				"owner_resolver_url": resolver.URL + "/resolve",
+				"token_service_url":  cm.URL + tokenServicePath,
+			})
+			cfgJSON := marshalConfig(t, cfg)
+			body := []byte(`{"ok":true}`)
+
+			assertDenied(t, runPluginCycle(t, cfgJSON, consentRequest(), body), "no consent yet")
+			cm.grant(owner)
+			assertAllowed(t, runPluginCycle(t, cfgJSON, consentRequest(), body), "after grant")
 		})
-	})
-
-	mux.HandleFunc("/v1/participants/me", func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, "Bearer itest-token", r.Header.Get("Authorization"))
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{"identifier": itestProviderDID, "selfDescriptionUri": selfDescriptionURL})
-	})
-
-	mux.HandleFunc("/v1/consents", consentListHandler(t, "Bearer itest-token", wantSubject, statuses))
-
-	mux.HandleFunc("/v1/participants", participantRegistryHandler)
-
-	return httptest.NewServer(mux)
-}
-
-// ccConfig is a plugin config using participant client credentials (no static
-// token, no explicit provider_sd — both are obtained from the consent-manager).
-func tokenServiceConfig(consentURL, resolverURL string) map[string]interface{} {
-	return map[string]interface{}{
-		"consent_api_url":    consentURL,
-		"owner_resolver_url": resolverURL,
-		"token_service_url":  consentURL + "/internal/tokens",
 	}
 }
 
-// TestIntegration_TokenServiceFlow drives the full OID4VP-token path: fetch a
-// token from the participant-local token service, derive the provider SD from
-// /me, then the two-call check.
-func TestIntegration_TokenServiceFlow(t *testing.T) {
-	srv := newConsentManagerTokenService(t, "did:key:zAlice",
-		"http://consent-facade:8080/participants/derived", []string{"granted"})
-	defer srv.Close()
-	resolver := newOwnerResolver(t, "did:key:zAlice")
-	defer resolver.Close()
-
-	resp := runPluginCycle(t, marshalConfig(t, tokenServiceConfig(srv.URL, resolver.URL+"/resolve")),
-		consentRequest(20, "did:key:zCaller"), []byte(`{"ok":true}`))
-
-	assert.Nil(t, resp.writtenBody, "granted consent via client credentials should pass through")
-}
-
-// TestIntegration_TokenServiceDenied verifies a not-granted consent denies via
-// the OID4VP-token path.
-func TestIntegration_TokenServiceDenied(t *testing.T) {
-	srv := newConsentManagerTokenService(t, "",
-		"http://consent-facade:8080/participants/derived", []string{"revoked"})
-	defer srv.Close()
-	resolver := newOwnerResolver(t, "did:key:zAlice")
-	defer resolver.Close()
-
-	resp := runPluginCycle(t, marshalConfig(t, tokenServiceConfig(srv.URL, resolver.URL+"/resolve")),
-		consentRequest(21, "did:key:zCaller"), []byte(`{"secret":"x"}`))
-
-	assert.Equal(t, 403, resp.writtenStatus)
-	assert.Equal(t, defaultDenyBody, string(resp.writtenBody))
-}
-
-// --- Resolver-mode integration tests ---
-
-// perOwnerConsentManager starts a consent-manager whose consent status is looked
-// up per data owner, so a multi-owner response can mix granted and revoked
-// owners. It records the owners it was asked about, in order.
-func perOwnerConsentManager(t *testing.T, statusByOwner map[string]string, asked *[]string) *httptest.Server {
-	t.Helper()
-	var mu sync.Mutex
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/consents", func(w http.ResponseWriter, r *http.Request) {
-		owner := r.URL.Query().Get("userIdentifier")
-		mu.Lock()
-		*asked = append(*asked, owner)
-		status, known := statusByOwner[owner]
-		mu.Unlock()
-		var records []map[string]interface{}
-		if known {
-			records = consentsGrantedTo([]string{status})
-		}
-		writeConsentPage(w, records)
-	})
-	registerParticipantEndpoints(mux)
-	srv := httptest.NewServer(mux)
-	t.Cleanup(srv.Close)
-	return srv
-}
-
-// TestIntegration_Resolver drives the resolver-mode decision matrix end to end:
-// a real ParseConf -> RequestFilter -> ResponseFilter against a mock resolver
-// and a mock consent-manager.
+// TestIntegration_Resolver drives the resolver decision matrix end to end in
+// each mode: a real ParseConf -> RequestFilter -> ResponseFilter against a mock
+// resolver and the consent-manager fake.
 func TestIntegration_Resolver(t *testing.T) {
 	const (
 		ownerAlice = "did:key:zAlice"
@@ -682,41 +864,50 @@ func TestIntegration_Resolver(t *testing.T) {
 		name          string
 		resolverReply map[string]interface{}
 		resolverCode  int // non-zero => the resolver answers with this status instead
-		statusByOwner map[string]string
-		failOpen      *bool
+		granted       []string
+		revoked       []string
+		failOpen      bool
 		wantDenied    bool
 		wantOwners    []string // owners the consent-manager must have been asked about
 	}{
 		{
 			name:          "every owner granted allows",
 			resolverReply: resolveReply(ownerAlice, ownerBob),
-			statusByOwner: map[string]string{ownerAlice: "granted", ownerBob: "granted"},
+			granted:       []string{ownerAlice, ownerBob},
 			wantOwners:    []string{ownerAlice, ownerBob},
 		},
 		{
 			name:          "one revoked owner denies the whole response (deny_all)",
 			resolverReply: resolveReply(ownerAlice, ownerBob),
-			statusByOwner: map[string]string{ownerAlice: "granted", ownerBob: "revoked"},
+			granted:       []string{ownerAlice},
+			revoked:       []string{ownerBob},
 			wantDenied:    true,
 			// Which owners get asked depends on the concurrent short-circuit, so
 			// only the decision is asserted here.
 		},
 		{
-			name:          "an owner unknown to the consent-manager denies",
+			name:          "an owner without any consent denies",
 			resolverReply: resolveReply(ownerAlice, ownerBob),
-			statusByOwner: map[string]string{ownerAlice: "granted"},
+			granted:       []string{ownerAlice},
 			wantDenied:    true,
+		},
+		{
+			name:          "an owner unknown to the consent-manager denies",
+			resolverReply: resolveReply("did:key:zStranger"),
+			granted:       []string{ownerAlice},
+			wantDenied:    true,
+			wantOwners:    []string{"did:key:zStranger"},
 		},
 		{
 			name:          "consentRequired false allows without any consent call",
 			resolverReply: map[string]interface{}{"consentRequired": false},
-			wantOwners:    nil,
+			wantOwners:    []string{},
 		},
 		{
 			name:          "consent required with no claims denies",
 			resolverReply: map[string]interface{}{"consentRequired": true, "claims": []map[string]string{}},
 			wantDenied:    true,
-			wantOwners:    nil,
+			wantOwners:    []string{},
 		},
 		{
 			name: "a claim with an empty owner denies",
@@ -725,80 +916,67 @@ func TestIntegration_Resolver(t *testing.T) {
 				"claims":          []map[string]string{{"ownerId": ""}},
 			},
 			wantDenied: true,
-			wantOwners: nil,
+			wantOwners: []string{},
 		},
 		{
 			name:         "resolver 5xx denies by default",
 			resolverCode: http.StatusInternalServerError,
 			wantDenied:   true,
-			wantOwners:   nil,
+			wantOwners:   []string{},
 		},
 		{
 			name:         "resolver 5xx passes through with fail_open",
 			resolverCode: http.StatusInternalServerError,
-			failOpen:     boolPtr(true),
-			wantOwners:   nil,
+			failOpen:     true,
+			wantOwners:   []string{},
 		},
 		{
 			name:          "duplicate owners are checked once",
 			resolverReply: resolveReply(ownerAlice, ownerAlice, ownerAlice),
-			statusByOwner: map[string]string{ownerAlice: "granted"},
+			granted:       []string{ownerAlice},
 			wantOwners:    []string{ownerAlice},
 		},
 	}
 
-	// Each case needs its own request id, so the context store entries cannot
-	// collide between subtests.
-	nextRequestID := uint32(100)
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			consent.ResetCaches()
-			nextRequestID++
+	for _, mode := range checkModes {
+		for _, tt := range tests {
+			t.Run(mode.mode+"/"+tt.name, func(t *testing.T) {
+				consent.ResetCaches()
+				cm := newDSCConsentManager(t)
+				for _, o := range tt.granted {
+					cm.grant(o)
+				}
+				for _, o := range tt.revoked {
+					cm.revoke(cm.grant(o))
+				}
 
-			var asked []string
-			cm := perOwnerConsentManager(t, tt.statusByOwner, &asked)
+				var resolver *httptest.Server
+				if tt.resolverCode != 0 {
+					resolver = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+						w.WriteHeader(tt.resolverCode)
+					}))
+					t.Cleanup(resolver.Close)
+				} else {
+					var received []resolveEnvelope
+					resolver = newRecordingOwnerResolver(t, tt.resolverReply, &received)
+				}
 
-			var resolver *httptest.Server
-			if tt.resolverCode != 0 {
-				resolver = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-					w.WriteHeader(tt.resolverCode)
-				}))
-			} else {
-				var received []resolveEnvelope
-				resolver = newRecordingOwnerResolver(t, tt.resolverReply, &received)
-			}
-			defer resolver.Close()
+				cfg := baseConfig(cm.URL, resolver.URL, mode.config, map[string]interface{}{"fail_open": tt.failOpen})
+				resp := runPluginCycle(t, marshalConfig(t, cfg), consentRequest(), []byte(`{"id":"urn:entity:1"}`))
 
-			cfg := baseConfig(cm.URL, resolver.URL+"/resolve")
-			if tt.failOpen != nil {
-				cfg["fail_open"] = *tt.failOpen
-			}
-
-			resp := runPluginCycle(t, marshalConfig(t, cfg),
-				consentRequest(nextRequestID, "did:key:zCaller"), []byte(`{"id":"urn:entity:1"}`))
-
-			if tt.wantDenied {
-				assert.Equal(t, 403, resp.writtenStatus)
-				assert.Equal(t, defaultDenyBody, string(resp.writtenBody))
-			} else {
-				assert.Nil(t, resp.writtenBody, "expected the response to pass through")
-				assert.Equal(t, 0, resp.writtenStatus)
-			}
-			if tt.wantOwners != nil {
-				// Checks run concurrently, so the order is not significant.
-				assert.ElementsMatch(t, tt.wantOwners, asked, "the consent-manager must be asked about exactly these owners")
-			}
-		})
+				if tt.wantDenied {
+					assertDenied(t, resp)
+				} else {
+					assertAllowed(t, resp, "expected the response to pass through")
+				}
+				if tt.wantOwners != nil {
+					// Checks run concurrently, so the order is not significant.
+					assert.ElementsMatch(t, tt.wantOwners, cm.askedSubjects(),
+						"the consent-manager must be asked about exactly these owners")
+				}
+			})
+		}
 	}
-}
-
-// resolveReply builds a /resolve reply requiring consent from the given owners.
-func resolveReply(owners ...string) map[string]interface{} {
-	claims := make([]map[string]string, 0, len(owners))
-	for _, o := range owners {
-		claims = append(claims, map[string]string{"ownerId": o})
-	}
-	return map[string]interface{}{"consentRequired": true, "claims": claims}
 }
 
 // TestIntegration_ResolverReceivesPartiesAndPayload verifies what the plugin
@@ -806,19 +984,16 @@ func resolveReply(owners ...string) map[string]interface{} {
 // (resolved via the participant registry), and the upstream payload as JSON.
 func TestIntegration_ResolverReceivesPartiesAndPayload(t *testing.T) {
 	consent.ResetCaches()
-
-	var asked []string
-	cm := perOwnerConsentManager(t, map[string]string{"did:key:zAlice": "granted"}, &asked)
+	cm := newDSCConsentManager(t)
+	cm.grant("did:key:zAlice")
 
 	var received []resolveEnvelope
 	resolver := newRecordingOwnerResolver(t, resolveReply("did:key:zAlice"), &received)
-	defer resolver.Close()
 
-	cfg := baseConfig(cm.URL, resolver.URL+"/resolve")
-	cfg["service"] = "personal-profiles"
+	cfg := baseConfig(cm.URL, resolver.URL, map[string]interface{}{"service": "personal-profiles"})
 
 	payload := []byte(`{"id":"urn:ngsi-ld:PersonalProfile:alice"}`)
-	runPluginCycle(t, marshalConfig(t, cfg), consentRequest(150, "did:key:zCaller"), payload)
+	runPluginCycle(t, marshalConfig(t, cfg), consentRequest(), payload)
 
 	require.Len(t, received, 1)
 	env := received[0]
@@ -827,46 +1002,34 @@ func TestIntegration_ResolverReceivesPartiesAndPayload(t *testing.T) {
 	assert.Equal(t, "/ngsi-ld/v1/entities/urn:ngsi-ld:PersonalProfile:alice", env.Resource.Path)
 	require.NotNil(t, env.Parties, "the contract parties must be sent, or the resolver cannot identify the contract")
 	assert.Equal(t, itestConsumerSD, env.Parties.Consumer, "the consumer DID must be mapped to its self-description")
-	assert.Equal(t, "http://consent-facade:8080/participants/org-itest", env.Parties.Provider)
+	assert.Equal(t, itestProviderSD, env.Parties.Provider)
 	require.NotNil(t, env.Body)
 	assert.Equal(t, "json", env.Body.Encoding)
 	assert.JSONEq(t, string(payload), string(env.Body.Content))
 }
 
 // TestIntegration_PartyResolutionFailureDenies verifies the fail-closed seam
-// from H-1 end to end: when the consumer cannot be mapped to a participant, the
+// end to end: when the consumer cannot be mapped to a participant, the
 // resolver is never asked and the response is denied — even with fail_open,
 // which must not turn a token naming an unregistered consumer into a bypass.
 func TestIntegration_PartyResolutionFailureDenies(t *testing.T) {
 	consent.ResetCaches()
+	cm := newDSCConsentManager(t)
 
-	var asked []string
-	cm := perOwnerConsentManager(t, map[string]string{}, &asked)
-
-	resolverCalled := false
+	var resolverCalled atomic.Bool
 	resolver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		resolverCalled = true
-		w.Header().Set("Content-Type", "application/json")
+		resolverCalled.Store(true)
 		// An unidentified-party resolve could plausibly answer "no contract
 		// governs this, so no consent is required" — an unconditional allow.
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{"consentRequired": false})
+		writeJSON(w, map[string]interface{}{"consentRequired": false})
 	}))
-	defer resolver.Close()
+	t.Cleanup(resolver.Close)
 
-	h := newMockRequestHeader()
-	h.Set("Authorization", "Bearer "+buildMockJWT(map[string]interface{}{
-		"verifiableCredential": map[string]interface{}{"issuer": "did:key:zUnregisteredConsumer"},
-	}))
-	req := &mockRequest{id: 160, method: "GET", path: []byte("/data"), header: h}
+	cfg := baseConfig(cm.URL, resolver.URL, map[string]interface{}{"fail_open": true})
 
-	cfg := baseConfig(cm.URL, resolver.URL+"/resolve")
-	cfg["fail_open"] = true
+	resp := runPluginCycle(t, marshalConfig(t, cfg),
+		consentRequestFrom("did:key:zUnregisteredConsumer"), []byte(`{"a":1}`))
 
-	resp := runPluginCycle(t, marshalConfig(t, cfg), req, []byte(`{"a":1}`))
-
-	assert.False(t, resolverCalled, "an unidentified consumer must not reach the resolver")
-	assert.Equal(t, 403, resp.writtenStatus, "an unidentified consumer must deny")
+	assert.False(t, resolverCalled.Load(), "an unidentified consumer must not reach the resolver")
+	assert.Equal(t, http.StatusForbidden, resp.writtenStatus, "an unidentified consumer must deny")
 }
-
-// boolPtr returns a pointer to b, for the optional fail_open flag.
-func boolPtr(b bool) *bool { return &b }
