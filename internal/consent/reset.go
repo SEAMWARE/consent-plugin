@@ -18,8 +18,8 @@
 package consent
 
 // ResetCaches drops every package-wide cache: the participant credentials
-// (token + derived provider self-description), the DID -> self-description
-// mappings, and the subject -> user-identifier mappings.
+// (token, provider self-description and identifier) and the DID ->
+// self-description mappings. Consent answers are never cached.
 //
 // It exists for tests. They currently pass only because httptest allocates a
 // fresh base URL per server, which happens to produce a fresh cache key; a test
@@ -35,8 +35,4 @@ func ResetCaches() {
 	participantSDMu.Lock()
 	participantSDCache = map[string]participantSDEntry{}
 	participantSDMu.Unlock()
-
-	identifierMu.Lock()
-	identifierCache = map[string]identifierEntry{}
-	identifierMu.Unlock()
 }

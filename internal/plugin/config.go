@@ -18,6 +18,7 @@
 package plugin
 
 import (
+	"consent-plugin/internal/consent"
 	"consent-plugin/internal/logging"
 	"encoding/json"
 	"errors"
@@ -100,6 +101,15 @@ const (
 	// consent-manager, not a URL.
 	DefaultTokenAudience = "consent-manager"
 
+	// CheckModeList looks consents up via GET /consents?userIdentifier=.
+	CheckModeList = "list"
+
+	// CheckModeCheck looks consents up via GET /consents/check.
+	CheckModeCheck = "check"
+
+	// DefaultCheckMode is the lookup mode used when check_mode is omitted.
+	DefaultCheckMode = CheckModeList
+
 	// DefaultJWTHeaderName is the default HTTP header containing the JWT token.
 	DefaultJWTHeaderName = "Authorization"
 
@@ -129,15 +139,12 @@ const (
 	MaxHTTPStatusCode = 599
 )
 
-// Environment variables that provide the participant credentials and consent
-// key out-of-band, so they need not live in the route config (plaintext in
+// Environment variables that provide the token service and audit endpoints
+// out-of-band, so they need not live in the route config (plaintext in
 // etcd). A value set in the route config always takes precedence; the env var
 // is only consulted when the corresponding field is empty. The plugin runner
 // inherits these from the APISIX container, which sources them from a Secret.
 const (
-	// EnvConsentKey supplies ConsentKey (x-visionstrust-consent-key).
-	EnvConsentKey = "CONSENT_KEY"
-
 	// EnvTokenServiceURL supplies TokenServiceURL (the participant-local OID4VP
 	// token service).
 	//
@@ -197,13 +204,6 @@ type Config struct {
 	// reader).
 	OwnerResolverURL string `json:"owner_resolver_url"`
 
-	// ConsentAPIHost overrides the HTTP Host header sent on consent-manager
-	// calls. Needed when ConsentAPIURL points at an in-cluster gateway service
-	// whose routes are host-scoped to the public ingress name: the TCP connection
-	// still uses the URL's host, but the Host header must equal the route's host
-	// or APISIX returns "404 Route Not Found".
-	ConsentAPIHost string `json:"consent_api_host,omitempty"`
-
 	// OwnerResolverTimeout is the per-call timeout in milliseconds for the
 	// OwnerResolver (defaults to DefaultOwnerResolverTimeout).
 	OwnerResolverTimeout int `json:"owner_resolver_timeout,omitempty"`
@@ -227,6 +227,28 @@ type Config struct {
 	// consent_purpose_unconstrained_total metric counts the checks this would
 	// have denied.
 	RequirePurpose bool `json:"require_purpose,omitempty"`
+
+	// RequireContract makes a resolved claim that names neither a contractUri
+	// nor a privacyNoticeId (with no route-level PrivacyNoticeID either) a
+	// denial instead of a check unscoped to any contract.
+	//
+	// Without it such a claim matches any consent this owner granted this
+	// consumer under this provider, whatever contract it was given for. Defaults
+	// to false, like RequirePurpose, because today's resolvers do not emit
+	// either field; turn it on once yours does.
+	RequireContract bool `json:"require_contract,omitempty"`
+
+	// CheckMode selects how a consent is looked up: CheckModeList (the default)
+	// lists the owner's granted consents, CheckModeCheck asks /consents/check
+	// and then reads the consent it names. Both apply the same match.
+	CheckMode string `json:"check_mode,omitempty"`
+
+	// PrivacyNoticeID is the route-level privacy notice (a UUID) consents are
+	// scoped to when a resolved claim names none.
+	PrivacyNoticeID string `json:"privacy_notice_id,omitempty"`
+
+	// Purpose is the processing purpose matched when a resolved claim names none.
+	Purpose string `json:"purpose,omitempty"`
 
 	// MaxResolveBodyBytes caps the upstream body forwarded to the OwnerResolver.
 	//
@@ -253,12 +275,6 @@ type Config struct {
 	// it can find the governing contract. Defaults to DefaultConsumerClaim. It is
 	// used for contract lookup ONLY - never to determine the data owner.
 	ConsumerClaim string `json:"consumer_claim,omitempty"`
-
-	// ConsentKey is the shared secret sent as the x-visionstrust-consent-key
-	// header on the identifier-search call. Optional: when the plugin runs
-	// behind the authority's facade, the facade injects the key server-side and
-	// this is not needed. Falls back to the EnvConsentKey env var when empty.
-	ConsentKey string `json:"consent_key,omitempty"`
 
 	// TokenServiceURL is the participant-local OID4VP token service the plugin
 	// asks for an access token — the consent-facade's POST /internal/tokens. The
@@ -377,6 +393,12 @@ func (c *Config) applyDefaults() {
 	if c.TokenAudience == "" {
 		c.TokenAudience = DefaultTokenAudience
 	}
+	if c.CheckMode == "" {
+		c.CheckMode = DefaultCheckMode
+	}
+	// The consent-manager serialises UUIDs in lowercase and notice ids are
+	// matched verbatim, so an uppercase route value would never match.
+	c.PrivacyNoticeID = strings.ToLower(c.PrivacyNoticeID)
 	if c.DenyStatusCode == 0 {
 		c.DenyStatusCode = DefaultDenyStatusCode
 	}
@@ -389,14 +411,11 @@ func (c *Config) applyDefaults() {
 }
 
 // applyEnv fills the credential fields from environment variables when they are
-// not set in the route config. This keeps the consent key and the participant
-// client secret out of the APISIX route config (and thus out of etcd): they are
+// not set in the route config. This keeps the token service and audit
+// endpoints out of the APISIX route config (and thus out of etcd): they are
 // delivered to the plugin runner via the APISIX container's env, sourced from a
 // Kubernetes Secret. A value present in the config always wins.
 func (c *Config) applyEnv() {
-	if c.ConsentKey == "" {
-		c.ConsentKey = os.Getenv(EnvConsentKey)
-	}
 	if c.TokenServiceURL == "" {
 		c.TokenServiceURL = os.Getenv(EnvTokenServiceURL)
 	}
@@ -500,6 +519,17 @@ func (c *Config) Validate() error {
 			"without a way to authenticate as the participant no consent check can succeed")
 	}
 
+	// check_mode=check without privacy_notice_id stays valid: the resolver may
+	// supply the notice id per claim.
+	if c.CheckMode != CheckModeList && c.CheckMode != CheckModeCheck {
+		return fmt.Errorf("config validation: check_mode must be %q or %q, got %q",
+			CheckModeList, CheckModeCheck, c.CheckMode)
+	}
+
+	if c.PrivacyNoticeID != "" && !consent.IsUUID(c.PrivacyNoticeID) {
+		return fmt.Errorf("config validation: privacy_notice_id must be a UUID, got %q", c.PrivacyNoticeID)
+	}
+
 	return nil
 }
 
@@ -514,6 +544,7 @@ func ParseConfig(in []byte) (*Config, error) {
 	if err := json.Unmarshal(in, &conf); err != nil {
 		return nil, fmt.Errorf("config parsing: failed to unmarshal JSON: %w", err)
 	}
+	warnRemovedKeys(in)
 
 	conf.applyDefaults()
 	conf.applyEnv()
@@ -528,4 +559,21 @@ func ParseConfig(in []byte) (*Config, error) {
 	}
 
 	return &conf, nil
+}
+
+// removedConfigKeys are options dropped with the move to dsc-consent-manager.
+// json.Unmarshal ignores them silently, so ParseConfig warns instead.
+var removedConfigKeys = []string{"consent_api_host", "consent_key"}
+
+// warnRemovedKeys logs each removed option still present in the route config.
+func warnRemovedKeys(in []byte) {
+	var raw map[string]json.RawMessage
+	if json.Unmarshal(in, &raw) != nil {
+		return
+	}
+	for _, key := range removedConfigKeys {
+		if _, ok := raw[key]; ok {
+			logging.Warnf("config option %q was removed with the move to dsc-consent-manager and is ignored", key)
+		}
+	}
 }

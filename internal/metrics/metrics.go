@@ -42,13 +42,14 @@ import (
 
 // Metric names. The consent_ prefix keeps them together in a shared registry.
 const (
-	decisionsMetric            = "consent_decisions_total"
-	dependencyCallsMetric      = "consent_dependency_calls_total"
-	dependencyLatency          = "consent_dependency_duration_seconds"
-	purposeUnconstrainedMetric = "consent_purpose_unconstrained_total"
-	contextStoreSizeMetric     = "consent_request_context_store_size"
-	contextEvictedMetric       = "consent_request_contexts_evicted_total"
-	auditDroppedMetric         = "consent_audit_events_dropped_total"
+	decisionsMetric             = "consent_decisions_total"
+	dependencyCallsMetric       = "consent_dependency_calls_total"
+	dependencyLatency           = "consent_dependency_duration_seconds"
+	purposeUnconstrainedMetric  = "consent_purpose_unconstrained_total"
+	contractUnconstrainedMetric = "consent_contract_unconstrained_total"
+	contextStoreSizeMetric      = "consent_request_context_store_size"
+	contextEvictedMetric        = "consent_request_contexts_evicted_total"
+	auditDroppedMetric          = "consent_audit_events_dropped_total"
 )
 
 // Dependency names used as the "dependency" label.
@@ -87,6 +88,10 @@ var (
 	// purpose to match against, i.e. checks where half of the consumer/purpose
 	// scoping was not actually applied.
 	purposeUnconstrained uint64
+
+	// contractUnconstrained counts consent checks run with neither a contract nor
+	// a privacy notice to scope them.
+	contractUnconstrained uint64
 
 	// callbacks are read at scrape time from whoever owns the number, so this
 	// package never has to be told when a store's size changes.
@@ -168,6 +173,15 @@ func RecordPurposeUnconstrained() {
 	purposeUnconstrained++
 }
 
+// RecordContractUnconstrained counts one consent check made with neither a
+// contractUri nor a privacy notice id, so any consent from this owner to this
+// consumer under this provider matches. Alert on it before enabling require_contract.
+func RecordContractUnconstrained() {
+	mu.Lock()
+	defer mu.Unlock()
+	contractUnconstrained++
+}
+
 // RegisterGauge publishes a value that can go up and down, read at scrape time.
 // The owner of the number keeps owning it; this package only asks for it.
 func RegisterGauge(name, help string, read func() float64) {
@@ -216,6 +230,10 @@ func render() string {
 	fmt.Fprintf(&out, "# HELP %s Consent checks run without a processing purpose to scope them.\n", purposeUnconstrainedMetric)
 	fmt.Fprintf(&out, "# TYPE %s counter\n", purposeUnconstrainedMetric)
 	fmt.Fprintf(&out, "%s %d\n", purposeUnconstrainedMetric, purposeUnconstrained)
+
+	fmt.Fprintf(&out, "# HELP %s Consent checks run without a contract or privacy notice to scope them.\n", contractUnconstrainedMetric)
+	fmt.Fprintf(&out, "# TYPE %s counter\n", contractUnconstrainedMetric)
+	fmt.Fprintf(&out, "%s %d\n", contractUnconstrainedMetric, contractUnconstrained)
 
 	fmt.Fprintf(&out, "# HELP %s Duration of outbound dependency calls in seconds.\n", dependencyLatency)
 	fmt.Fprintf(&out, "# TYPE %s histogram\n", dependencyLatency)
@@ -305,6 +323,7 @@ func Reset() {
 	dependencyCalls = map[labelPair]uint64{}
 	latency = map[string]*histogram{}
 	purposeUnconstrained = 0
+	contractUnconstrained = 0
 	mu.Unlock()
 
 	callbackMu.Lock()

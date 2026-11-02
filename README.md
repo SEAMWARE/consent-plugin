@@ -1,15 +1,15 @@
 # consent-plugin
 
-An Apache APISIX Go plugin that gates access to personal data on the **consent of the data subject**. It hooks into the APISIX request/response lifecycle via the [go-plugin-runner](https://github.com/apache/apisix-go-plugin-runner) and verifies consent against a [Prometheus-X / Visions consent-manager](https://github.com/Prometheus-X-association/consent-manager) before letting a response reach the client.
+An Apache APISIX Go plugin that gates access to personal data on the **consent of the data subject**. It hooks into the APISIX request/response lifecycle via the [go-plugin-runner](https://github.com/apache/apisix-go-plugin-runner) and verifies consent against a [dsc-consent-manager](https://github.com/wistefan/dsc-consent-manager) ([API](https://github.com/wistefan/dsc-consent-manager/blob/main/api/openapi.yaml)) before letting a response reach the client.
 
 ## How It Works
 
 The plugin is attached to a route in **both** external-plugin phases:
 
 1. **Request phase** (`ext-plugin-pre-req` → `RequestFilter`): captures the request context — method, path, and the JWT claims decoded from the configured header — and stores it keyed by the Nginx `$request_id`.
-2. **Response phase** (`ext-plugin-post-resp` → `ResponseFilter`): loads that context, asks the **OwnerResolver** who owns the data in the upstream response, and runs a **two-call consent check** per resolved owner:
-   - **allow** (every resolved owner has a granted consent for this consumer) — the response passes through unchanged.
-   - **deny** (any owner has no such consent, or is unknown to the consent-manager) — the response is replaced with a configurable error status and body.
+2. **Response phase** (`ext-plugin-post-resp` → `ResponseFilter`): loads that context, asks the **OwnerResolver** who owns the data in the upstream response, and checks each resolved owner DID against the dsc-consent-manager (see [Consent check](#consent-check-dsc-consent-manager)):
+   - **allow** (every resolved owner has a consent in force that names this provider, this consumer and, when the resolver scoped the claim, its contract, privacy notice and purpose) — the response passes through unchanged.
+   - **deny** (any owner has no such consent, or the check could not be made) — the response is replaced with a configurable error status and body.
 
 The decision is a coarse allow/deny and is **independent of the response body's shape**, so an empty or non-JSON personal-data response is still gated.
 
@@ -48,61 +48,149 @@ owners are checked, and how large a payload is forwarded to the resolver.
 Per-owner consent checks run concurrently (up to 8 in flight) and short-circuit
 on the first denial, so latency is not the sum over owners.
 
-## The two-call consent check
+## Consent check (dsc-consent-manager)
 
-The consent-manager has no single "is there consent?" endpoint, so a check is two calls (`{consent_api_url}{consent_api_prefix}` is the base, e.g. `http://consent-manager:3000/v1`):
+Every call goes to `{consent_api_url}{consent_api_prefix}` (e.g.
+`http://consent-manager:8080/v1`) with `Authorization: Bearer <participant token>`
+and nothing else: no consent key and no `Host` rewrite. Each resolved owner DID is
+the `userIdentifier`. `check_mode` picks one of two lookups:
 
-**1. Resolve the owner to a user identifier** — authenticated with the consent key:
+**`list` (the default)**, one call per owner:
 ```
-POST {base}/users/identifier/search
-Header: x-visionstrust-consent-key: <consent_key>
-Body:   { "selfDescription": "<provider_sd>", "email": "<owner DID>" }
-→      { "userIdentifier": "<id>" }        (404 / empty ⇒ unknown owner ⇒ deny)
+GET {base}/consents?userIdentifier=<owner DID>[&privacyNoticeId=<id>]&page=0&size=50
+→   { "content": [ { "id", "privacyNoticeId", "provider", "consumer", "consented",
+                     "purposes": [...], "contractUri", ... } ], "totalPages": ... }
 ```
+`privacyNoticeId` is sent whenever one is known. Pages are read until a record
+matches, up to 20 pages. Reaching that limit without a match denies.
 
-**2. List that user's consents** — authenticated with the participant JWT:
+**`check`**, two calls per owner, so one extra round trip:
 ```
-GET {base}/consents/participants/{userIdentifier}?receipt=true
-Header: Authorization: Bearer <participant_token>
-→      { "consents": [ { "status": "granted", "consumer": {...}, "purposes": [...], "data": [...] } ] }
+GET {base}/consents/check?userIdentifier=<owner DID>&privacyNoticeId=<id>[&purpose=<purpose>]
+→   { "valid": true, "consentId": "<uuid>", ... }
+GET {base}/consents/{consentId}?format=full
+→   { "id", "provider", "consumer", "consented", ... }
 ```
+`/consents/check` only says that *some* consent is in force. It does not say which
+consumer that consent names. Without the read, a route-level `privacy_notice_id`
+would release data to any consumer on another consumer's grant, so the plugin
+**always** reads the consent and matches it like a list entry. `valid:false`, a
+`consentId` that is not a UUID, or a `404` on the read (this participant is not a
+party to it) deny. `/consents/check` requires a notice id, so in check mode a claim
+without one is always denied, whatever `fail_open` says, and no call is made.
 
-Access is **allowed** only if a returned consent satisfies all of:
+The dsc-consent-manager allows only one consent per subject and notice in force,
+so both modes reach the same decision. `list` is cheaper and is the default.
+`check` is never selected automatically.
 
-- `status == "granted"`;
-- it was granted to the **consuming participant** identified from the token (a
-  consent names one consumer; one granted to X is not authority for Y);
-- it covers the **purpose**, when the resolver named one for the claim (set
-  `require_purpose` to deny rather than proceed unscoped when it does not);
-- it covers the **data resource**, when the resolver scoped the claim to one.
+### Matching
 
-The owner DID is sent as the user `email` (the consent-manager's
-DID-in-email convention).
+Both modes accept a consent record only when all of these hold. Every comparison
+is verbatim and case-sensitive:
+
+- `consented` is `true`;
+- `provider` is **this** participant's own `identifier` from `/participants/me`.
+  The consent endpoints also return consents in which this participant is the
+  *consumer* of another provider's contract;
+- `consumer` is the **requesting consumer's DID** (from `consumer_claim`). A
+  consent granted to X is no authority for Y;
+- `contractUri` equals the claim's `contractUri`, when set;
+- `privacyNoticeId` equals the effective notice id, when set. That is the claim's
+  `privacyNoticeId`, or else `privacy_notice_id`. It is compared on the client
+  too, so the scoping does not rest only on the server's query filter;
+- `purposes[]` contains the effective purpose, when set. That is the claim's
+  `purpose`, or else `purpose`.
+
+A claim's `dataResource` is **not** matched. The consent's `data[]` lists the
+notice's personal-data *categories*, not resource identifiers.
+
+Consent answers are **never cached** in either mode, so a revocation denies the
+next request.
+
+### Purpose and contract scoping
+
+A claim without a purpose matches a consent for any purpose. A claim without a
+`contractUri` or `privacyNoticeId` (on a route without `privacy_notice_id`)
+matches any consent this owner gave this consumer under this provider, whatever
+the contract. Both gaps are counted (`consent_purpose_unconstrained_total`,
+`consent_contract_unconstrained_total`) and logged as rate-limited warnings.
+`require_purpose` and `require_contract` turn each gap into a deny, which ignores
+`fail_open`. Enable them once your OwnerResolver emits those fields.
+
+Have the resolver emit a `contractUri` or `privacyNoticeId` **per claim**, rather
+than fixing `privacy_notice_id` on the route. When a contract's notice is
+superseded (`/privacy-notices/by-contract` creates a new active notice), grants
+given since then carry the new notice id and older grants keep the old one. A fixed
+route value then quietly denies every new grant while the old ones keep passing,
+until someone updates it. Notice purposes are full sentences, so a resolver that
+sets `purpose` must emit the notice's purpose string exactly.
+
+### Failure mapping
+
+| Consent-manager answer | Result |
+|------------------------|--------|
+| `200`, no matching record / `valid:false` / `404` on the consent read | **deny** (consent), reason logged |
+| `401` after one token refresh, or `403` (caller may be deregistered) | `ErrConsentManagerAuth`: **always denied** |
+| any other `4xx` except `429` (e.g. `400`, a `404` from a wrong `consent_api_prefix`, `405`, `422`) | `ErrConsentManagerRejected`: **always denied** |
+| `429`, `5xx`, transport error, timeout | retryable outage: `fail_open` decides |
+
+The same mapping applies to every endpoint: the registry, `/participants/me` and
+both consent modes. "Always denied" means `fail_open` does not apply, because these
+are misconfigurations or revoked access rather than outages. A dependency's
+response body never reaches an error or audit reason. It is logged at debug level
+only.
 
 ### Participant authentication
 
-Call 2 needs a **participant JWT**, and call 1 needs the **provider
-self-description**. The plugin holds no participant credentials of its own: it
-asks the participant-local OID4VP token service (the consent-facade's
-`POST /internal/tokens`) for a short-lived token by **audience name**, then
-derives the provider SD from `/participants/me`:
+The plugin holds no participant credentials of its own. It asks the
+participant-local OID4VP token service (the consent-facade's
+`POST /internal/tokens`) for a short-lived token by **audience name**. The token
+must carry the `PARTICIPANT` role and the participant-identifier claim, which every
+operation above requires. The plugin then reads its own identity:
 
 ```
 POST {token_service_url}   { "audience": "<token_audience>" }  →  { "access_token": ..., "expires_in": ... }
-GET  {base}/participants/me   Authorization: Bearer <token>    →  { "selfDescriptionURL": ... }
+GET  {base}/participants/me   Authorization: Bearer <token>    →  { "identifier": "<DID>", "selfDescriptionUri": ... }
 ```
 
-The token is cached and refreshed on expiry or a 401. The cache is keyed on the
-full credential identity (base URL, host, prefix, audience, token-service URL,
-provider SD, and hashes of the static token and consent key), so two routes
-fronting different participants against the same consent-manager never share a
-token. A static `participant_token` and/or an explicit `provider_sd` remain
-supported as overrides for tests and manual runs.
+`identifier` is the provider every matched consent must name. It is always fetched,
+even with a static `participant_token` and `provider_sd`. `selfDescriptionUri` (or
+`provider_sd`, when set) is sent to the OwnerResolver as `parties.provider`. The
+token is cached and refreshed on expiry or a `401`. The cache key covers the base
+URL, prefix, audience, token-service URL, `provider_sd` and a hash of the static
+token, so two routes fronting different participants against the same
+consent-manager never share a token. A static `participant_token` and/or an
+explicit `provider_sd` remain supported as overrides for tests and manual runs.
 
-The consumer DID from the token is translated to a self-description URL via
-`GET {base}/participants` (the consent-manager doubles as the participant
-registry), cached for 10 minutes — and negatively for 30 seconds, so one
-misconfigured DID does not re-fetch the registry on every request.
+The consumer DID from the token is mapped to its self-description URI, which is
+sent to the OwnerResolver as `parties.consumer`, through the participant registry:
+
+```
+GET {base}/participants?identifier=<consumer DID>
+→   { "content": [ { "identifier": "<DID>", "selfDescriptionUri": ..., "deregisteredAt": ... } ] }
+```
+
+An unknown DID, a participant without a `selfDescriptionUri` or one with
+`deregisteredAt` set is always denied (`ErrParticipantNotRegistered`). A mapping is
+cached for **10 minutes**, and a negative answer for 30 seconds. So a consumer
+deregistered while its mapping is cached still passes the *registry* gate for up
+to 10 minutes. The consent check itself is never cached, so a revoked consent
+still denies on the next request.
+
+### Migrating from the Prometheus-X / Visions consent-manager
+
+This is a **major** release. The plugin now speaks only the dsc-consent-manager
+API. These options were removed:
+
+- `consent_api_host` (the `Host` rewrite). The bearer token is the only
+  authentication.
+- `consent_key` and the `CONSENT_KEY` environment variable (the
+  `x-visionstrust-consent-key` header and `/users/identifier/search`). Owners are
+  checked by DID directly.
+
+A route config that still sets a removed option loads, and the runner logs a warning
+for each one. `check_mode`, `privacy_notice_id`, `purpose` and `require_contract`
+are new.
 
 ## Configuration Reference
 
@@ -110,24 +198,26 @@ Configured via the APISIX route plugin JSON (identically on both `ext-plugin-pre
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `consent_api_url` | `string` | **Yes** | — | Base URL of the consent-manager (e.g. `http://consent-manager:3000`). `http`/`https` only. |
+| `consent_api_url` | `string` | **Yes** | — | Base URL of the dsc-consent-manager (e.g. `http://consent-manager:8080`). `http`/`https` only. |
 | `owner_resolver_url` | `string` | **Yes** | — | The OwnerResolver `/resolve` endpoint. The data owner is resolved from the response payload; without it the plugin cannot determine whose consent to check, so the route fails to load. `http`/`https` only. |
 | `owner_resolver_timeout` | `int` | No | `2000` | Per-call timeout in ms for `/resolve`. Range 1–60000. |
 | `service` | `string` | No | — | Logical dataset id sent to the OwnerResolver as `resource.service`, so it can select the rule for this route. |
 | `response_phase_timeout` | `int` | No | `10000` | Budget in ms for the **entire** response phase — party lookups, `/resolve`, and every per-owner consent check together. APISIX holds the buffered response for this whole time, so it is bounded independently of the per-call timeouts. Range 1–120000. |
 | `require_purpose` | `bool` | No | `false` | Deny when a resolved claim names no processing purpose. Purpose matching depends on the OwnerResolver populating an optional field, so a resolver that never sets it runs with purpose scoping silently disabled; turn this on once yours emits one. `consent_purpose_unconstrained_total` counts the checks it would deny. |
+| `require_contract` | `bool` | No | `false` | Deny when a resolved claim names neither a `contractUri` nor a `privacyNoticeId` and the route sets no `privacy_notice_id`. Without it such a claim matches any consent the owner granted this consumer under this provider, whatever the contract; turn it on once your resolver emits one of the two. |
+| `check_mode` | `string` | No | `list` | How consents are looked up: `list` (`GET /consents?userIdentifier=`, one call per owner) or `check` (`GET /consents/check`, then a read of the consent it names — one extra round trip). Both apply the same match. Any other value fails validation. |
+| `privacy_notice_id` | `string` | No | — | Route-level privacy notice UUID consents are scoped to when a resolved claim names none. Must be a UUID; it is lowercased on load. In `check` mode a claim without any notice id is denied. |
+| `purpose` | `string` | No | — | Processing purpose matched (verbatim) when a resolved claim names none. A claim's own purpose wins. |
 | `max_resolve_body_bytes` | `int` | No | `1048576` | Maximum upstream body forwarded to the OwnerResolver. A larger body is denied rather than copied — the body is held whole, validated and marshalled again, so the peak footprint is ~3× its size per in-flight request on top of APISIX's own buffering. Range 1–104857600. |
 | `max_owners_per_response` | `int` | No | `50` | Maximum distinct data owners checked for one response. A response resolving to more is denied rather than answered after an unbounded number of consent calls. Range 1–1000. |
-| `consumer_claim` | `string` | No | `verifiableCredential.issuer` | Dotted claim path naming the **consuming participant**. Supports array indexing (`verifiableCredential[0].issuer`), and a bare segment landing on an array traverses its first element — a Verifiable Presentation routinely carries `verifiableCredential` as an array. Used for the contract lookup and to scope the consent match — never for ownership. |
-| `consent_api_prefix` | `string` | No | `/v1` | API prefix prepended to endpoint paths (the consent-manager's `API_PREFIX`). Must start with `/`; a trailing `/` is trimmed. |
-| `consent_api_host` | `string` | No | — | Overrides the HTTP `Host` header on consent-manager calls. Needed when `consent_api_url` points at an in-cluster service whose gateway route is host-scoped to the public ingress name. |
+| `consumer_claim` | `string` | No | `verifiableCredential.issuer` | Dotted claim path naming the **consuming participant**. Supports array indexing (`verifiableCredential[0].issuer`), and a bare segment landing on an array traverses its first element — a Verifiable Presentation routinely carries `verifiableCredential` as an array. Mapped to the consumer's self-description for the OwnerResolver, and matched against each consent's `consumer` — never used for ownership. |
+| `consent_api_prefix` | `string` | No | `/v1` | API prefix prepended to endpoint paths (the dsc-consent-manager serves `/v1`). Must start with `/`; a trailing `/` is trimmed. |
 | `consent_api_timeout` | `int` | No | `5000` | Per-call timeout in ms. Range 1–60000. |
-| `consent_key` | `string` | No | — | Shared secret sent as `x-visionstrust-consent-key` on call 1. **Optional**: behind the authority's facade the key is injected server-side (and overrides anything sent here). Falls back to `CONSENT_KEY`. |
 | `token_service_url` | `string` | Yes* | — | The participant-local OID4VP token service (the consent-facade's `POST /internal/tokens`). Falls back to `CONSENT_TOKEN_SERVICE_URL`. `http`/`https` only. |
 | `token_audience` | `string` | No | `consent-manager` | Audience **name** asked of the token service — its own configured target, not a URL. |
 | `participant_token_ttl` | `int` | No | `3000` | Seconds a fetched token is cached. The token service's own `expires_in` wins when shorter. Range 1–86400. |
 | `participant_token` | `string` | Yes* | — | *Static*, pre-obtained participant token. An override for tests and manual runs; prefer `token_service_url`, which refreshes automatically. |
-| `provider_sd` | `string` | No | — | Provider self-description URL for call 1. Derived from `/participants/me` when unset. |
+| `provider_sd` | `string` | No | — | Provider self-description URL sent to the OwnerResolver as `parties.provider`. Derived from `/participants/me` when unset. The provider identifier consents are matched on always comes from `/participants/me`. |
 | `jwt_header_name` | `string` | No | `Authorization` | Header carrying the JWT. |
 | `jwt_claims_to_forward` | `[]string` | No | `[]` (all) | Claims to decode and keep. Empty decodes all. The root of `consumer_claim` is always added. |
 | `deny_status_code` | `int` | No | `403` | Status returned on deny. Range 100–599. |
@@ -146,12 +236,12 @@ and is rejected rather than loaded.
 
 † Required only when `audit_enabled` is `true`.
 
-**Credentials via env.** `consent_key`, `token_service_url` and
-`audit_otlp_endpoint` each fall back to an environment variable (`CONSENT_KEY`,
-`CONSENT_TOKEN_SERVICE_URL`, `CONSENT_AUDIT_OTLP_ENDPOINT`) when omitted from the
-route config; a value in the config always wins. The plugin runner inherits these
-from the APISIX container, which sources them from a Kubernetes Secret — so
-secrets need not be stored as plaintext in the route config (etcd).
+**Credentials via env.** `token_service_url` and `audit_otlp_endpoint` each
+fall back to an environment variable (`CONSENT_TOKEN_SERVICE_URL`,
+`CONSENT_AUDIT_OTLP_ENDPOINT`) when omitted from the route config; a value in
+the config always wins. The plugin runner inherits these from the APISIX
+container, which sources them from a Kubernetes Secret — so secrets need not be
+stored as plaintext in the route config (etcd).
 
 **Metrics.** Set the `CONSENT_METRICS_ADDRESS` environment variable on the
 plugin runner (e.g. `:9091`) to expose Prometheus metrics on `/metrics`:
@@ -159,18 +249,19 @@ plugin runner (e.g. `:9091`) to expose Prometheus metrics on `/metrics`:
 labelled apart from one caused by consent),
 `consent_dependency_calls_total{dependency,outcome}`,
 `consent_dependency_duration_seconds{dependency}`,
+`consent_purpose_unconstrained_total`, `consent_contract_unconstrained_total`,
 `consent_request_context_store_size`, `consent_request_contexts_evicted_total`
 and `consent_audit_events_dropped_total`. Metrics are off unless the variable is
 set — the runner is otherwise reached only over its unix socket, so opening a
 TCP port is the deployment's decision.
 
-**Access audit log.** With `audit_enabled`, the plugin emits one OTLP/HTTP **log record** per **checked data owner** (so the log answers whose consent was consulted and what each said, not merely whether the response was released; a request that failed before any owner was reached is recorded once as itself) to `audit_otlp_endpoint`, stamped with resource `service.name=<audit_service_name>` and attributes `event.domain=audit`, `consent.decision`, `consent.reason`, `enduser.id`, `http.request.method`, `url.path`, `http.request.id`. Emission is asynchronous, batched, and best-effort (a bounded queue drops rather than blocking the request path), so a slow/absent Collector never affects data access. The queue is flushed when the runner exits (it returns on `SIGTERM`/`SIGINT`), so a redeploy does not discard the last flush interval of decisions. Reasons are sanitised before export (control characters collapsed, length bounded) so an upstream error body cannot reach the audit sink verbatim. Mark-based routing lets the Collector send these to an append-only audit sink separate from traces.
+**Access audit log.** With `audit_enabled`, the plugin emits one OTLP/HTTP **log record** per **checked data owner** (so the log answers whose consent was consulted and what each said, not merely whether the response was released; a request that failed before any owner was reached is recorded once as itself) to `audit_otlp_endpoint`, stamped with resource `service.name=<audit_service_name>` and attributes `event.domain=audit`, `consent.decision`, `consent.reason`, `enduser.id`, `http.request.method`, `url.path`, `http.request.id`, and on an allow `consent.id` (the matched consent, so its receipt can be fetched later with `GET /consents/{id}?format=receipt`). Emission is asynchronous, batched, and best-effort (a bounded queue drops rather than blocking the request path), so a slow/absent Collector never affects data access. The queue is flushed when the runner exits (it returns on `SIGTERM`/`SIGINT`), so a redeploy does not discard the last flush interval of decisions. Reasons are sanitised before export (control characters collapsed, length bounded) so an upstream error body cannot reach the audit sink verbatim. Mark-based routing lets the Collector send these to an append-only audit sink separate from traces.
 
 ## APISIX Route Configuration Example
 
 ```bash
 # Both phases must carry the SAME configuration, so build it once.
-PLUGIN_CONF='{"consent_api_url":"http://consent-manager:3000","consent_api_prefix":"/v1","owner_resolver_url":"http://owner-resolver:8080/resolve","service":"personal-profiles","token_service_url":"http://consent-facade:8080/internal/tokens","token_audience":"consent-manager","fail_open":false}'
+PLUGIN_CONF='{"consent_api_url":"http://consent-manager:8080","consent_api_prefix":"/v1","check_mode":"list","require_purpose":true,"require_contract":true,"owner_resolver_url":"http://owner-resolver:8080/resolve","service":"personal-profiles","token_service_url":"http://consent-facade:8080/internal/tokens","token_audience":"consent-manager","fail_open":false}'
 
 jq -n --arg conf "$PLUGIN_CONF" '{
   uri: "/*",
@@ -186,8 +277,8 @@ jq -n --arg conf "$PLUGIN_CONF" '{
   -d @-
 ```
 
-`consent_key` is omitted above because the facade injects it; set it (or
-`CONSENT_KEY`) for a facade-less deployment. Both phases are required and must
+`require_purpose` and `require_contract` assume a resolver that emits a purpose
+and a `contractUri` or `privacyNoticeId` per claim. Both phases are required and must
 carry the **same** configuration: `pre-req` captures the token context,
 `post-resp` performs the check and blocks the response.
 
@@ -216,7 +307,7 @@ docker compose up --build
 ```
 
 The stack is self-contained — APISIX + etcd, the plugin runner, a mock
-consent-manager / OwnerResolver / token service, an echo upstream, and an OTel
+dsc-consent-manager / OwnerResolver / token service, an echo upstream, and an OTel
 Collector for the audit log:
 
 | Service | Description | Ports |
@@ -224,7 +315,7 @@ Collector for the audit log:
 | `etcd` | APISIX configuration store | `2379` |
 | `apisix` | APISIX gateway | `9080` (HTTP), `9180` (Admin API) |
 | `plugin-runner` | consent-filter plugin runner | — (unix socket, shared volume) |
-| `mock` | consent-manager + OwnerResolver + token service stubs (`dev/mocks/`) | `8081` |
+| `mock` | dsc-consent-manager + OwnerResolver + token service stubs (`dev/mocks/`) | `8081` |
 | `upstream` | echo service standing in for the personal-data API | — |
 | `otel-collector` | receives the access-decision audit log | `4318` |
 
@@ -234,7 +325,7 @@ set for it in the compose file).
 Then create the gated route:
 
 ```bash
-PLUGIN_CONF='{"consent_api_url":"http://mock:8080","owner_resolver_url":"http://mock:8080/resolve","token_service_url":"http://mock:8080/internal/tokens","consent_key":"dev-consent-key","service":"dev-profiles","fail_open":false}'
+PLUGIN_CONF='{"consent_api_url":"http://mock:8080","owner_resolver_url":"http://mock:8080/resolve","service":"dev-profiles","audit_enabled":true,"fail_open":false}'
 
 jq -n --arg conf "$PLUGIN_CONF" '{
   uri: "/*",
@@ -251,8 +342,14 @@ TOKEN_PAYLOAD=$(printf '{"verifiableCredential":{"issuer":"did:key:zDevConsumer"
 curl -i http://127.0.0.1:9080/profile -H "Authorization: Bearer e30.${TOKEN_PAYLOAD}.nosig"
 ```
 
-Change the `consumer` in `dev/mocks/consents.json` (or the `status` to
-`revoked`) and restart the `mock` service to watch the same request be denied.
+`token_service_url` and `audit_otlp_endpoint` come from the runner's environment
+(`CONSENT_TOKEN_SERVICE_URL`, `CONSENT_AUDIT_OTLP_ENDPOINT`) in the compose file.
+Add `"check_mode":"check"` to the config to use `/consents/check` instead.
+
+Set `consented` to `false` in `dev/mocks/consents.json` (or `valid` to `false` in
+`consents-check.json` for check mode), or change the consent's `consumer`, and
+restart the `mock` service to watch the same request be denied. A token naming any
+other consumer is denied, because the registry stub knows only `did:key:zDevConsumer`.
 The `otel-collector` logs show the audit record for each decision.
 
 > The socket is shared through a **directory** (the `runner-socket` volume), not
@@ -271,7 +368,7 @@ consent-plugin/
 │   │   ├── config.go              # Configuration schema and validation
 │   │   └── context.go             # Bounded request-context store keyed by $request_id
 │   ├── consent/
-│   │   ├── client.go              # Two-call consent-manager client
+│   │   ├── client.go              # dsc-consent-manager client (token, registry, list/check modes)
 │   │   └── models.go              # Request/response models and Decision type
 │   ├── ownerresolver/
 │   │   └── client.go              # OwnerResolver /resolve client (who owns the data)

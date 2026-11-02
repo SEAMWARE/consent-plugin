@@ -187,33 +187,27 @@ func testReqKey(id uint32) string {
 
 // --- Consent-manager mock (the two endpoints the plugin calls) ---
 
-// newConsentManager starts a mock consent-manager. identifier-search returns
-// userID (or 404 when empty); participant-consents returns one consent per
-// entry in statuses.
-func newConsentManager(t *testing.T, userID string, statuses []string) *httptest.Server {
+// newConsentManager starts a mock consent-manager whose /consents list returns
+// one consent per entry in statuses, each naming testConsumerDID as consumer.
+func newConsentManager(t *testing.T, statuses []string) *httptest.Server {
 	t.Helper()
+	return newConsentListServer(func(*http.Request) []map[string]interface{} {
+		return consentsGrantedTo(testConsumerDID, statuses)
+	})
+}
+
+// newConsentListServer serves GET /v1/consents as a single ConsentPage built by
+// content, plus the participant endpoints every client configuration calls.
+func newConsentListServer(content func(*http.Request) []map[string]interface{}) *httptest.Server {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/users/identifier/search", func(w http.ResponseWriter, r *http.Request) {
-		if userID == "" {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
+	mux.HandleFunc("/v1/consents", func(w http.ResponseWriter, r *http.Request) {
+		records := content(r)
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{"userIdentifier": userID})
-	})
-	mux.HandleFunc("/v1/consents/participants/", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{"consents": consentsGrantedTo(testConsumerSD, statuses)})
-	})
-	// The participant registry, used to translate the consumer DID from the token
-	// into the self-description URL a contract names its parties by.
-	mux.HandleFunc("/v1/participants", participantRegistryHandler)
-	mux.HandleFunc("/v1/participants/me", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{
-			"selfDescriptionURL": "http://catalog/participants/provider",
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"content": records, "page": 0, "size": len(records), "totalElements": len(records), "totalPages": 1,
 		})
 	})
+	registerParticipantEndpoints(mux)
 	return httptest.NewServer(mux)
 }
 
@@ -223,20 +217,37 @@ func newConsentManager(t *testing.T, userID string, statuses []string) *httptest
 // contract lookup.
 func newFailingConsentManager() *httptest.Server {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/participants", participantRegistryHandler)
+	registerParticipantEndpoints(mux)
 	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	})
 	return httptest.NewServer(mux)
 }
 
-// participantRegistryHandler serves the consent-manager's participant registry,
-// which maps the consumer DID from the token to its self-description URL.
-func participantRegistryHandler(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode([]map[string]string{
-		{"did": testConsumerDID, "selfDescriptionURL": testConsumerSD},
+// testProviderDID is the identifier /participants/me reports for this participant.
+const testProviderDID = "did:key:zProvider"
+
+// registerParticipantEndpoints serves the participant registry and
+// /participants/me, which every client configuration now calls.
+func registerParticipantEndpoints(mux *http.ServeMux) {
+	mux.HandleFunc("/v1/participants", participantRegistryHandler)
+	mux.HandleFunc("/v1/participants/me", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"identifier": testProviderDID, "selfDescriptionUri": "http://catalog/participants/provider",
+		})
 	})
+}
+
+// participantRegistryHandler serves the consent-manager's participant registry,
+// which maps the consumer DID from the token to its self-description URI.
+func participantRegistryHandler(w http.ResponseWriter, r *http.Request) {
+	content := []map[string]string{}
+	if r.URL.Query().Get("identifier") == testConsumerDID {
+		content = append(content, map[string]string{"identifier": testConsumerDID, "selfDescriptionUri": testConsumerSD})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{"content": content})
 }
 
 // newUncalledConsentManager fails the test if a CONSENT CHECK reaches the
@@ -246,7 +257,7 @@ func participantRegistryHandler(w http.ResponseWriter, _ *http.Request) {
 func newUncalledConsentManager(t *testing.T) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/participants", participantRegistryHandler)
+	registerParticipantEndpoints(mux)
 	mux.HandleFunc("/", func(_ http.ResponseWriter, r *http.Request) {
 		t.Errorf("consent-manager must not be called for a consent check (path %s)", r.URL.Path)
 	})
@@ -257,8 +268,11 @@ func newUncalledConsentManager(t *testing.T) *httptest.Server {
 
 // resolverClaim is one (owner [x dataResource]) requirement in a mock /resolve reply.
 type resolverClaim struct {
-	OwnerID      string `json:"ownerId"`
-	DataResource string `json:"dataResource,omitempty"`
+	OwnerID         string `json:"ownerId"`
+	DataResource    string `json:"dataResource,omitempty"`
+	Purpose         string `json:"purpose,omitempty"`
+	ContractURI     string `json:"contractUri,omitempty"`
+	PrivacyNoticeID string `json:"privacyNoticeId,omitempty"`
 }
 
 // resolverResponse is the mock OwnerResolver's /resolve reply.
@@ -320,7 +334,6 @@ func newTestConfig(consentAPIURL, resolverURL string) *Config {
 		MaxResolveBodyBytes:     DefaultMaxResolveBodyBytes,
 		ConsumerClaim:           DefaultConsumerClaim,
 		JWTHeaderName:           DefaultJWTHeaderName,
-		ConsentKey:              "test-consent-key",
 		ParticipantToken:        "test-participant-token",
 		ProviderSD:              "http://consent-facade:8080/participants/org-1",
 		DenyStatusCode:          DefaultDenyStatusCode,
@@ -348,17 +361,19 @@ const testOwnerDID = "did:key:zOwner"
 const testConsumerDID = "did:key:zConsumer"
 
 // testConsumerSD is the self-description URL the participant registry maps
-// testConsumerDID to — the consumer every consent check is scoped to.
+// testConsumerDID to; only the resolver sees it, consents name the DID.
 const testConsumerSD = "http://catalog/participants/consumer"
 
-// consentsGrantedTo builds consent records with the given statuses, each granted
-// to the named consuming participant.
+// consentsGrantedTo builds consent records with the given statuses, each naming
+// this participant as provider and the given DID as consumer.
 func consentsGrantedTo(consumer string, statuses []string) []map[string]interface{} {
 	consents := make([]map[string]interface{}, 0, len(statuses))
 	for _, s := range statuses {
 		consents = append(consents, map[string]interface{}{
-			"status":   s,
-			"consumer": map[string]string{"selfDescriptionURL": consumer},
+			"status":    strings.ToUpper(s),
+			"consented": s == "granted",
+			"provider":  testProviderDID,
+			"consumer":  consumer,
 		})
 	}
 	return consents
@@ -381,22 +396,22 @@ func TestConsentFilter_ResponseFilter(t *testing.T) {
 		{
 			name:           "granted consent for the resolved owner passes the response through",
 			setupContext:   storeRequest,
-			consentServer:  func(t *testing.T) *httptest.Server { return newConsentManager(t, "uid-1", []string{"granted"}) },
+			consentServer:  func(t *testing.T) *httptest.Server { return newConsentManager(t, []string{"granted"}) },
 			resolverServer: func(t *testing.T) *httptest.Server { return newOwnerResolver(t, ownedBy(testOwnerDID)) },
 			wantNoWrite:    true,
 		},
 		{
 			name:              "no granted consent denies with the default response",
 			setupContext:      storeRequest,
-			consentServer:     func(t *testing.T) *httptest.Server { return newConsentManager(t, "uid-1", []string{"revoked"}) },
+			consentServer:     func(t *testing.T) *httptest.Server { return newConsentManager(t, []string{"revoked"}) },
 			resolverServer:    func(t *testing.T) *httptest.Server { return newOwnerResolver(t, ownedBy(testOwnerDID)) },
 			wantWrittenBody:   DefaultDenyResponseBody,
 			wantWrittenStatus: DefaultDenyStatusCode,
 		},
 		{
-			name:              "unknown owner (404 on search) denies",
+			name:              "owner without consents denies",
 			setupContext:      storeRequest,
-			consentServer:     func(t *testing.T) *httptest.Server { return newConsentManager(t, "", nil) },
+			consentServer:     func(t *testing.T) *httptest.Server { return newConsentManager(t, nil) },
 			resolverServer:    func(t *testing.T) *httptest.Server { return newOwnerResolver(t, ownedBy(testOwnerDID)) },
 			wantWrittenBody:   DefaultDenyResponseBody,
 			wantWrittenStatus: DefaultDenyStatusCode,
@@ -404,7 +419,7 @@ func TestConsentFilter_ResponseFilter(t *testing.T) {
 		{
 			name:           "deny uses the custom status code and body",
 			setupContext:   storeRequest,
-			consentServer:  func(t *testing.T) *httptest.Server { return newConsentManager(t, "uid-1", []string{"revoked"}) },
+			consentServer:  func(t *testing.T) *httptest.Server { return newConsentManager(t, []string{"revoked"}) },
 			resolverServer: func(t *testing.T) *httptest.Server { return newOwnerResolver(t, ownedBy(testOwnerDID)) },
 			configFn: func(cfg *Config) {
 				cfg.DenyStatusCode = 451
@@ -447,7 +462,7 @@ func TestConsentFilter_ResponseFilter(t *testing.T) {
 		{
 			name:              "one denying owner denies the whole response (deny_all)",
 			setupContext:      storeRequest,
-			consentServer:     func(t *testing.T) *httptest.Server { return newConsentManager(t, "uid-1", []string{"revoked"}) },
+			consentServer:     func(t *testing.T) *httptest.Server { return newConsentManager(t, []string{"revoked"}) },
 			resolverServer:    func(t *testing.T) *httptest.Server { return newOwnerResolver(t, ownedBy("did:key:zA", "did:key:zB")) },
 			wantWrittenBody:   DefaultDenyResponseBody,
 			wantWrittenStatus: DefaultDenyStatusCode,
@@ -627,7 +642,7 @@ const responseContentTypeJSON = "application/json"
 
 func TestConsentFilter_ResponseFilter_ContextCleanup(t *testing.T) {
 	clearContextStore()
-	server := newConsentManager(t, "uid-1", []string{"granted"})
+	server := newConsentManager(t, []string{"granted"})
 	defer server.Close()
 	resolver := newOwnerResolver(t, ownedBy(testOwnerDID))
 	defer resolver.Close()
@@ -644,7 +659,7 @@ func TestConsentFilter_ResponseFilter_ContextCleanup(t *testing.T) {
 
 func TestConsentFilter_ResponseFilter_DenySetsContentType(t *testing.T) {
 	clearContextStore()
-	server := newConsentManager(t, "uid-1", []string{"revoked"})
+	server := newConsentManager(t, []string{"revoked"})
 	defer server.Close()
 	resolver := newOwnerResolver(t, ownedBy(testOwnerDID))
 	defer resolver.Close()
@@ -667,19 +682,9 @@ func TestConsentFilter_ResponseFilter_DenySetsContentType(t *testing.T) {
 func TestResponseFilter_ConsentScopedToConsumer(t *testing.T) {
 	clearContextStore()
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/users/identifier/search", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{"userIdentifier": "uid-owner"})
+	server := newConsentListServer(func(*http.Request) []map[string]interface{} {
+		return consentsGrantedTo("did:key:zSomeoneElse", []string{"granted"})
 	})
-	mux.HandleFunc("/v1/consents/participants/", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"consents": consentsGrantedTo("http://catalog/participants/someone-else", []string{"granted"}),
-		})
-	})
-	mux.HandleFunc("/v1/participants", participantRegistryHandler)
-	server := httptest.NewServer(mux)
 	defer server.Close()
 
 	resolver := newOwnerResolver(t, ownedBy(testOwnerDID))
@@ -698,27 +703,17 @@ func TestResponseFilter_ConsentScopedToConsumer(t *testing.T) {
 // TestResponseFilter_OwnerNotRequestor is the regression test for the removed
 // legacy mode: the consent that decides access must be the RESOLVED OWNER's, not
 // the caller's. The resolver names Bob as the owner while the token's "sub" is
-// Alice; the identifier search must ask about Bob.
+// Alice; the consent lookup must ask about Bob.
 func TestResponseFilter_OwnerNotRequestor(t *testing.T) {
 	clearContextStore()
 
 	const owner = "did:key:zBob"
 	var searchedSubjects []string
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/users/identifier/search", func(w http.ResponseWriter, r *http.Request) {
-		var body map[string]string
-		_ = json.NewDecoder(r.Body).Decode(&body)
-		searchedSubjects = append(searchedSubjects, body["email"])
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{"userIdentifier": "uid-bob"})
+	server := newConsentListServer(func(r *http.Request) []map[string]interface{} {
+		searchedSubjects = append(searchedSubjects, r.URL.Query().Get("userIdentifier"))
+		return consentsGrantedTo(testConsumerDID, []string{"revoked"})
 	})
-	mux.HandleFunc("/v1/consents/participants/", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{"consents": consentsGrantedTo(testConsumerSD, []string{"revoked"})})
-	})
-	mux.HandleFunc("/v1/participants", participantRegistryHandler)
-	server := httptest.NewServer(mux)
 	defer server.Close()
 
 	resolver := newOwnerResolver(t, ownedBy(owner))
@@ -785,7 +780,7 @@ func TestResponseFilter_ResponsePhaseDeadline(t *testing.T) {
 	// that can end the wait.
 	release := make(chan struct{})
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/participants", participantRegistryHandler)
+	registerParticipantEndpoints(mux)
 	mux.HandleFunc("/", func(_ http.ResponseWriter, r *http.Request) {
 		select {
 		case <-release:
@@ -817,10 +812,12 @@ func TestResponseFilter_ResponsePhaseDeadline(t *testing.T) {
 }
 
 // TestDistinctClaims verifies the resolver's claims collapse to the distinct
-// (owner, dataResource) pairs that actually need checking, in resolver order.
+// consent questions that actually need checking, in resolver order, keyed on
+// every match criterion after the config fallbacks.
 func TestDistinctClaims(t *testing.T) {
 	tests := []struct {
 		name    string
+		cfgFn   func(cfg *Config)
 		claims  []ownerresolver.Claim
 		want    []ownerClaim
 		wantErr bool
@@ -841,6 +838,39 @@ func TestDistinctClaims(t *testing.T) {
 			want:   []ownerClaim{{owner: "a", purpose: "p1"}},
 		},
 		{
+			// Collapsing these would check purpose A only and release the
+			// response under deny_all even when purpose B has no grant.
+			name:   "same owner and resource with different purposes stays distinct",
+			claims: []ownerresolver.Claim{{OwnerID: "a", Purpose: "p1"}, {OwnerID: "a", Purpose: "p2"}},
+			want:   []ownerClaim{{owner: "a", purpose: "p1"}, {owner: "a", purpose: "p2"}},
+		},
+		{
+			name:   "no purpose and the config purpose collapse after the fallback",
+			cfgFn:  func(cfg *Config) { cfg.Purpose = "p1" },
+			claims: []ownerresolver.Claim{{OwnerID: "a"}, {OwnerID: "a", Purpose: "p1"}},
+			want:   []ownerClaim{{owner: "a", purpose: "p1"}},
+		},
+		{
+			name:   "the claim purpose wins over the config purpose",
+			cfgFn:  func(cfg *Config) { cfg.Purpose = "p1" },
+			claims: []ownerresolver.Claim{{OwnerID: "a", Purpose: "p2"}},
+			want:   []ownerClaim{{owner: "a", purpose: "p2"}},
+		},
+		{
+			name:   "different contracts stay distinct",
+			claims: []ownerresolver.Claim{{OwnerID: "a", ContractURI: "c1"}, {OwnerID: "a", ContractURI: "c2"}},
+			want:   []ownerClaim{{owner: "a", contractURI: "c1"}, {owner: "a", contractURI: "c2"}},
+		},
+		{
+			name:   "the route notice id is the fallback and the claim's is lower-cased",
+			cfgFn:  func(cfg *Config) { cfg.PrivacyNoticeID = testRouteNoticeID },
+			claims: []ownerresolver.Claim{{OwnerID: "a"}, {OwnerID: "b", PrivacyNoticeID: strings.ToUpper(testClaimNoticeID)}},
+			want: []ownerClaim{
+				{owner: "a", privacyNoticeID: testRouteNoticeID},
+				{owner: "b", privacyNoticeID: testClaimNoticeID},
+			},
+		},
+		{
 			name:    "a claim without an owner is an error",
 			claims:  []ownerresolver.Claim{{OwnerID: "a"}, {OwnerID: ""}},
 			wantErr: true,
@@ -849,7 +879,11 @@ func TestDistinctClaims(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := distinctClaims(tt.claims)
+			cfg := newTestConfig("http://consent.invalid", "http://resolver.invalid/resolve")
+			if tt.cfgFn != nil {
+				tt.cfgFn(cfg)
+			}
+			got, err := distinctClaims(cfg, tt.claims)
 			if tt.wantErr {
 				require.Error(t, err)
 				return
@@ -868,7 +902,7 @@ func TestDistinctClaims(t *testing.T) {
 // the upstream's.
 func TestDenyResponse_StripsUpstreamHeaders(t *testing.T) {
 	clearContextStore()
-	server := newConsentManager(t, "uid-1", []string{"revoked"})
+	server := newConsentManager(t, []string{"revoked"})
 	defer server.Close()
 	resolver := newOwnerResolver(t, ownedBy(testOwnerDID))
 	defer resolver.Close()
@@ -907,7 +941,7 @@ func TestDenyResponse_StripsUpstreamHeaders(t *testing.T) {
 // which is not what an access-decision log is for.
 func TestRecordAudit_RecordsEveryCheckedOwner(t *testing.T) {
 	type record struct {
-		subject, decision string
+		subject, decision, consentID string
 	}
 	var mu sync.Mutex
 	var got []record
@@ -941,6 +975,8 @@ func TestRecordAudit_RecordsEveryCheckedOwner(t *testing.T) {
 							rec.subject = attr.Value.StringValue
 						case "consent.decision":
 							rec.decision = attr.Value.StringValue
+						case "consent.id":
+							rec.consentID = attr.Value.StringValue
 						}
 					}
 					got = append(got, rec)
@@ -963,7 +999,7 @@ func TestRecordAudit_RecordsEveryCheckedOwner(t *testing.T) {
 		requestID: "req-1",
 		method:    "GET",
 		checked: []checkedOwner{
-			{subject: "did:key:zA", resource: "/r", decision: decisionAllow},
+			{subject: "did:key:zA", resource: "/r", decision: decisionAllow, consentID: testConsentID},
 			{subject: "did:key:zB", resource: "/r", decision: decisionDeny, reason: "no granted consent"},
 		},
 	})
@@ -972,7 +1008,7 @@ func TestRecordAudit_RecordsEveryCheckedOwner(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	assert.ElementsMatch(t, []record{
-		{subject: "did:key:zA", decision: decisionAllow},
+		{subject: "did:key:zA", decision: decisionAllow, consentID: testConsentID},
 		{subject: "did:key:zB", decision: decisionDeny},
 	}, got, "every consulted owner must appear in the audit log, not only the one that denied")
 }
@@ -1142,7 +1178,7 @@ func TestClaimPathRoot(t *testing.T) {
 // path with an empty header diff.
 func TestResponseFilter_AllowDoesNotTouchHeaders(t *testing.T) {
 	clearContextStore()
-	server := newConsentManager(t, "uid-1", []string{"granted"})
+	server := newConsentManager(t, []string{"granted"})
 	defer server.Close()
 	resolver := newOwnerResolver(t, ownedBy(testOwnerDID))
 	defer resolver.Close()
@@ -1576,7 +1612,7 @@ func TestAuditReasonCarriesNoDependencyBody(t *testing.T) {
 	defer collector.Close()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/participants", participantRegistryHandler)
+	registerParticipantEndpoints(mux)
 	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		// A dependency echoing personal data in its error page.
@@ -1605,6 +1641,488 @@ func TestAuditReasonCarriesNoDependencyBody(t *testing.T) {
 		assert.NotContains(t, payload, leakedIdentifier,
 			"a dependency response body must not reach the audit sink through the reason")
 	}
-	assert.Contains(t, strings.Join(reasons, ""), "identifier search returned status 500",
+	assert.Contains(t, strings.Join(reasons, ""), "consents list returned status 500",
 		"the reason should classify the failure instead")
+}
+
+// TestFailModeForError pins which dependency errors fail_open may never release on.
+func TestFailModeForError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want failMode
+	}{
+		{"no credentials", consent.ErrNoCredentials, failAlwaysClosed},
+		{"participant not registered", fmt.Errorf("wrapped: %w", consent.ErrParticipantNotRegistered), failAlwaysClosed},
+		{"consent-manager auth", fmt.Errorf("wrapped: %w", consent.ErrConsentManagerAuth), failAlwaysClosed},
+		{"consent-manager rejected", fmt.Errorf("wrapped: %w", consent.ErrConsentManagerRejected), failAlwaysClosed},
+		{"outage", errors.New("consent client: participants lookup returned status 503"), failByPolicy},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, failModeForError(tt.err))
+		})
+	}
+}
+
+// --- dsc-consent-manager modes ---
+
+// Fixed UUIDs for the mode tests.
+const (
+	testClaimNoticeID = "3f1e2d4c-5b6a-4789-8abc-def012345678"
+	testRouteNoticeID = "9a8b7c6d-5e4f-4321-8fed-cba987654321"
+	testConsentID     = "0f0e0d0c-0b0a-4908-8706-050403020100"
+	testContractURI   = "https://contracts.example/c1"
+)
+
+// consentScript drives scriptedConsentManager. A zero status answers 200.
+type consentScript struct {
+	listStatus  int
+	listRecords []map[string]interface{}
+	checkStatus int
+	validity    map[string]interface{}
+	readRecord  map[string]interface{}
+	delay       time.Duration
+}
+
+// consentCall is one request scriptedConsentManager received on a consent endpoint.
+type consentCall struct {
+	path  string
+	query url.Values
+}
+
+// scriptedConsentManager serves the dsc-consent-manager consent endpoints from a
+// script and records every consent call, so tests can assert which mode ran.
+type scriptedConsentManager struct {
+	*httptest.Server
+	mu    sync.Mutex
+	calls []consentCall
+}
+
+// newScriptedConsentManager starts a scriptedConsentManager. The participant
+// endpoints always answer, so failures under test come from the consent calls.
+func newScriptedConsentManager(script consentScript) *scriptedConsentManager {
+	m := &scriptedConsentManager{}
+	mux := http.NewServeMux()
+	registerParticipantEndpoints(mux)
+	mux.HandleFunc("/v1/consents", func(w http.ResponseWriter, r *http.Request) {
+		if !m.record(w, r, script.delay, script.listStatus) {
+			return
+		}
+		writeJSON(w, map[string]interface{}{
+			"content": script.listRecords, "page": 0, "size": len(script.listRecords),
+			"totalElements": len(script.listRecords), "totalPages": 1,
+		})
+	})
+	mux.HandleFunc("/v1/consents/check", func(w http.ResponseWriter, r *http.Request) {
+		if m.record(w, r, script.delay, script.checkStatus) {
+			writeJSON(w, script.validity)
+		}
+	})
+	mux.HandleFunc("/v1/consents/{id}", func(w http.ResponseWriter, r *http.Request) {
+		if m.record(w, r, script.delay, 0) {
+			writeJSON(w, script.readRecord)
+		}
+	})
+	m.Server = httptest.NewServer(mux)
+	return m
+}
+
+// record logs the call, waits delay (or until the client gives up) and writes a
+// non-zero status. It reports whether the handler should still write a body.
+func (m *scriptedConsentManager) record(w http.ResponseWriter, r *http.Request, delay time.Duration, status int) bool {
+	m.mu.Lock()
+	m.calls = append(m.calls, consentCall{path: r.URL.Path, query: r.URL.Query()})
+	m.mu.Unlock()
+	if delay > 0 {
+		select {
+		case <-time.After(delay):
+		case <-r.Context().Done():
+			return false
+		}
+	}
+	if status != 0 {
+		w.WriteHeader(status)
+		return false
+	}
+	return true
+}
+
+// recordedCalls returns the consent calls received so far.
+func (m *scriptedConsentManager) recordedCalls() []consentCall {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]consentCall(nil), m.calls...)
+}
+
+// writeJSON writes v as a JSON 200 response.
+func writeJSON(w http.ResponseWriter, v interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+// grant builds a consented record for testOwnerDID's consent to testConsumerDID,
+// with the optional scope fields set from fields.
+func grant(fields map[string]interface{}) map[string]interface{} {
+	record := map[string]interface{}{
+		"id": testConsentID, "status": "GRANTED", "consented": true,
+		"provider": testProviderDID, "consumer": testConsumerDID,
+	}
+	for k, v := range fields {
+		record[k] = v
+	}
+	return record
+}
+
+// runResponseFilter resolves claims with a mock resolver, runs the response phase
+// against server and returns the mock response.
+func runResponseFilter(t *testing.T, serverURL string, claims []resolverClaim, cfgFn func(cfg *Config)) *mockResponse {
+	t.Helper()
+	clearContextStore()
+	consent.ResetCaches()
+	resolver := newOwnerResolver(t, resolverResponse{ConsentRequired: true, Claims: claims})
+	t.Cleanup(resolver.Close)
+
+	cfg := newTestConfig(serverURL, resolver.URL+"/resolve")
+	cfg.CheckMode = DefaultCheckMode
+	if cfgFn != nil {
+		cfgFn(cfg)
+	}
+	const id = uint32(300)
+	storeRequest(id)
+	resp := newMockResponse(id, []byte(`{"id":"x"}`))
+	(&ConsentFilter{}).ResponseFilter(cfg, resp)
+	return resp
+}
+
+// TestResponseFilter_ModeSelection verifies check_mode alone picks the endpoint,
+// that list mode sends the effective notice id as a filter, and that check mode
+// without a notice id denies without calling the consent-manager.
+func TestResponseFilter_ModeSelection(t *testing.T) {
+	listGrant := func(notice string) consentScript {
+		return consentScript{listRecords: []map[string]interface{}{grant(map[string]interface{}{"privacyNoticeId": notice})}}
+	}
+	checkGrant := consentScript{
+		validity:   map[string]interface{}{"valid": true, "consentId": testConsentID},
+		readRecord: grant(map[string]interface{}{"privacyNoticeId": testClaimNoticeID}),
+	}
+	tests := []struct {
+		name       string
+		script     consentScript
+		claim      resolverClaim
+		cfgFn      func(cfg *Config)
+		wantPaths  []string
+		wantNotice string
+		wantDenied bool
+	}{
+		{
+			name:      "unset check_mode is list mode",
+			script:    listGrant(""),
+			claim:     resolverClaim{OwnerID: testOwnerDID},
+			cfgFn:     func(cfg *Config) { cfg.CheckMode = "" },
+			wantPaths: []string{"/v1/consents"},
+		},
+		{
+			name:      "default list mode without a notice id sends no filter",
+			script:    listGrant(""),
+			claim:     resolverClaim{OwnerID: testOwnerDID},
+			wantPaths: []string{"/v1/consents"},
+		},
+		{
+			name:       "a claim notice id is a list filter and does not switch to check",
+			script:     listGrant(testClaimNoticeID),
+			claim:      resolverClaim{OwnerID: testOwnerDID, PrivacyNoticeID: testClaimNoticeID},
+			wantPaths:  []string{"/v1/consents"},
+			wantNotice: testClaimNoticeID,
+		},
+		{
+			name:       "the route notice id is a list filter",
+			script:     listGrant(testRouteNoticeID),
+			claim:      resolverClaim{OwnerID: testOwnerDID},
+			cfgFn:      func(cfg *Config) { cfg.PrivacyNoticeID = testRouteNoticeID },
+			wantPaths:  []string{"/v1/consents"},
+			wantNotice: testRouteNoticeID,
+		},
+		{
+			name:       "forced check mode checks and then reads the consent",
+			script:     checkGrant,
+			claim:      resolverClaim{OwnerID: testOwnerDID, PrivacyNoticeID: testClaimNoticeID},
+			cfgFn:      func(cfg *Config) { cfg.CheckMode = CheckModeCheck },
+			wantPaths:  []string{"/v1/consents/check", "/v1/consents/" + testConsentID},
+			wantNotice: testClaimNoticeID,
+		},
+		{
+			// The check cannot be made at all, so fail_open must not release it.
+			name:   "forced check mode without a notice id denies even with fail-open",
+			script: checkGrant,
+			claim:  resolverClaim{OwnerID: testOwnerDID},
+			cfgFn: func(cfg *Config) {
+				cfg.CheckMode = CheckModeCheck
+				cfg.FailOpen = boolPtr(true)
+			},
+			wantDenied: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := newScriptedConsentManager(tt.script)
+			defer server.Close()
+
+			resp := runResponseFilter(t, server.URL, []resolverClaim{tt.claim}, tt.cfgFn)
+
+			calls := server.recordedCalls()
+			paths := make([]string, 0, len(calls))
+			for _, call := range calls {
+				paths = append(paths, call.path)
+			}
+			assert.Equal(t, tt.wantPaths, slicesOrNil(paths))
+			if tt.wantDenied {
+				assert.Equal(t, DefaultDenyStatusCode, resp.writtenStatus)
+				return
+			}
+			assert.Equal(t, 0, resp.writtenStatus, "a matching consent must pass the response through")
+			require.NotEmpty(t, calls)
+			assert.Equal(t, tt.wantNotice, calls[0].query.Get("privacyNoticeId"))
+		})
+	}
+}
+
+// slicesOrNil maps an empty slice to nil so it compares equal to an unset want.
+func slicesOrNil(s []string) []string {
+	if len(s) == 0 {
+		return nil
+	}
+	return s
+}
+
+// TestResponseFilter_PurposeScoping verifies the effective purpose (claim, else
+// config) is what a consent must cover, and what require_purpose checks.
+func TestResponseFilter_PurposeScoping(t *testing.T) {
+	const (
+		claimPurpose  = "Trip planning"
+		configPurpose = "Route optimisation"
+	)
+	tests := []struct {
+		name           string
+		grantPurposes  []string
+		claims         []resolverClaim
+		configPurpose  string
+		requirePurpose bool
+		wantDenied     bool
+	}{
+		{
+			name:           "the config purpose satisfies require_purpose and must be granted",
+			grantPurposes:  []string{configPurpose},
+			claims:         []resolverClaim{{OwnerID: testOwnerDID}},
+			configPurpose:  configPurpose,
+			requirePurpose: true,
+		},
+		{
+			name:           "no purpose anywhere denies under require_purpose",
+			grantPurposes:  []string{configPurpose},
+			claims:         []resolverClaim{{OwnerID: testOwnerDID}},
+			requirePurpose: true,
+			wantDenied:     true,
+		},
+		{
+			name:          "the claim purpose wins over the config purpose",
+			grantPurposes: []string{configPurpose},
+			claims:        []resolverClaim{{OwnerID: testOwnerDID, Purpose: claimPurpose}},
+			configPurpose: configPurpose,
+			wantDenied:    true,
+		},
+		{
+			name:          "a grant for one of two purposes denies the response (deny_all)",
+			grantPurposes: []string{claimPurpose},
+			claims: []resolverClaim{
+				{OwnerID: testOwnerDID, Purpose: claimPurpose},
+				{OwnerID: testOwnerDID, Purpose: configPurpose},
+			},
+			wantDenied: true,
+		},
+		{
+			name:          "grants for both purposes allow",
+			grantPurposes: []string{claimPurpose, configPurpose},
+			claims: []resolverClaim{
+				{OwnerID: testOwnerDID, Purpose: claimPurpose},
+				{OwnerID: testOwnerDID, Purpose: configPurpose},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := newScriptedConsentManager(consentScript{
+				listRecords: []map[string]interface{}{grant(map[string]interface{}{"purposes": tt.grantPurposes})},
+			})
+			defer server.Close()
+
+			resp := runResponseFilter(t, server.URL, tt.claims, func(cfg *Config) {
+				cfg.Purpose = tt.configPurpose
+				cfg.RequirePurpose = tt.requirePurpose
+			})
+
+			if tt.wantDenied {
+				assert.Equal(t, DefaultDenyStatusCode, resp.writtenStatus)
+				return
+			}
+			assert.Equal(t, 0, resp.writtenStatus)
+		})
+	}
+}
+
+// TestResponseFilter_DistinctClaimsCheckOnce verifies a claim without a purpose
+// and one naming the config purpose are one consent question, not two.
+func TestResponseFilter_DistinctClaimsCheckOnce(t *testing.T) {
+	const purpose = "Trip planning"
+	server := newScriptedConsentManager(consentScript{
+		listRecords: []map[string]interface{}{grant(map[string]interface{}{"purposes": []string{purpose}})},
+	})
+	defer server.Close()
+
+	resp := runResponseFilter(t, server.URL,
+		[]resolverClaim{{OwnerID: testOwnerDID}, {OwnerID: testOwnerDID, Purpose: purpose}},
+		func(cfg *Config) { cfg.Purpose = purpose })
+
+	assert.Equal(t, 0, resp.writtenStatus)
+	assert.Len(t, server.recordedCalls(), 1)
+}
+
+// TestResponseFilter_ContractScoping verifies an unscoped claim is counted and
+// checked, or denied under require_contract whatever the fail policy, and that a
+// claim contractUri, claim notice id or route privacy_notice_id each scope it.
+func TestResponseFilter_ContractScoping(t *testing.T) {
+	scopedGrant := grant(map[string]interface{}{"contractUri": testContractURI, "privacyNoticeId": testClaimNoticeID})
+	routeGrant := grant(map[string]interface{}{"privacyNoticeId": testRouteNoticeID})
+	tests := []struct {
+		name            string
+		claim           resolverClaim
+		record          map[string]interface{}
+		routeNotice     string
+		requireContract bool
+		wantDenied      bool
+		wantCalls       int
+		wantUnscoped    int
+	}{
+		{
+			name:         "an unscoped claim is checked and counted",
+			claim:        resolverClaim{OwnerID: testOwnerDID},
+			record:       scopedGrant,
+			wantCalls:    1,
+			wantUnscoped: 1,
+		},
+		{
+			name:            "an unscoped claim denies under require_contract even with fail-open",
+			claim:           resolverClaim{OwnerID: testOwnerDID},
+			record:          scopedGrant,
+			requireContract: true,
+			wantDenied:      true,
+		},
+		{
+			name:            "a claim contractUri scopes it",
+			claim:           resolverClaim{OwnerID: testOwnerDID, ContractURI: testContractURI},
+			record:          scopedGrant,
+			requireContract: true,
+			wantCalls:       1,
+		},
+		{
+			name:            "a claim notice id scopes it",
+			claim:           resolverClaim{OwnerID: testOwnerDID, PrivacyNoticeID: testClaimNoticeID},
+			record:          scopedGrant,
+			requireContract: true,
+			wantCalls:       1,
+		},
+		{
+			name:            "the route privacy_notice_id scopes it",
+			claim:           resolverClaim{OwnerID: testOwnerDID},
+			record:          routeGrant,
+			routeNotice:     testRouteNoticeID,
+			requireContract: true,
+			wantCalls:       1,
+		},
+		{
+			name:            "a consent under another contract denies",
+			claim:           resolverClaim{OwnerID: testOwnerDID, ContractURI: "https://contracts.example/other"},
+			record:          scopedGrant,
+			requireContract: true,
+			wantDenied:      true,
+			wantCalls:       1,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			metrics.Reset()
+			t.Cleanup(metrics.Reset)
+			server := newScriptedConsentManager(consentScript{listRecords: []map[string]interface{}{tt.record}})
+			defer server.Close()
+
+			resp := runResponseFilter(t, server.URL, []resolverClaim{tt.claim}, func(cfg *Config) {
+				cfg.PrivacyNoticeID = tt.routeNotice
+				cfg.RequireContract = tt.requireContract
+				cfg.FailOpen = boolPtr(true)
+			})
+
+			assert.Len(t, server.recordedCalls(), tt.wantCalls)
+			assert.Contains(t, metricsExposition(), fmt.Sprintf("consent_contract_unconstrained_total %d", tt.wantUnscoped))
+			if tt.wantDenied {
+				assert.Equal(t, DefaultDenyStatusCode, resp.writtenStatus)
+				return
+			}
+			assert.Equal(t, 0, resp.writtenStatus)
+		})
+	}
+}
+
+// TestResponseFilter_FailureMapping pins the consent-manager failure mapping end
+// to end: a definite deny and every permanent rejection deny whatever the fail
+// policy, while a retryable failure follows fail_open.
+func TestResponseFilter_FailureMapping(t *testing.T) {
+	// consentTimeoutMs is the per-call budget the slow cases overrun.
+	const consentTimeoutMs = 50
+	slowDelay := 20 * consentTimeoutMs * time.Millisecond
+
+	tests := []struct {
+		name     string
+		script   consentScript
+		check    bool
+		failOpen bool
+		wantPass bool
+	}{
+		{name: "no matching consent", script: consentScript{listRecords: []map[string]interface{}{grant(map[string]interface{}{"consumer": "did:key:zOther"})}}, failOpen: true},
+		{name: "valid:false", script: consentScript{validity: map[string]interface{}{"valid": false, "reason": "revoked"}}, check: true, failOpen: true},
+		{name: "401", script: consentScript{listStatus: http.StatusUnauthorized}, failOpen: true},
+		{name: "403", script: consentScript{listStatus: http.StatusForbidden}, failOpen: true},
+		{name: "400", script: consentScript{listStatus: http.StatusBadRequest}, failOpen: true},
+		{name: "404 on the list", script: consentScript{listStatus: http.StatusNotFound}, failOpen: true},
+		{name: "403 on check", script: consentScript{checkStatus: http.StatusForbidden}, check: true, failOpen: true},
+		{name: "429 fail-closed", script: consentScript{listStatus: http.StatusTooManyRequests}},
+		{name: "429 fail-open", script: consentScript{listStatus: http.StatusTooManyRequests}, failOpen: true, wantPass: true},
+		{name: "5xx fail-closed", script: consentScript{listStatus: http.StatusBadGateway}},
+		{name: "5xx fail-open", script: consentScript{listStatus: http.StatusServiceUnavailable}, failOpen: true, wantPass: true},
+		{name: "5xx on check fail-open", script: consentScript{checkStatus: http.StatusInternalServerError}, check: true, failOpen: true, wantPass: true},
+		{name: "timeout fail-closed", script: consentScript{delay: slowDelay}},
+		{name: "timeout fail-open", script: consentScript{delay: slowDelay}, failOpen: true, wantPass: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := newScriptedConsentManager(tt.script)
+			defer server.Close()
+
+			resp := runResponseFilter(t, server.URL,
+				[]resolverClaim{{OwnerID: testOwnerDID, PrivacyNoticeID: testClaimNoticeID}},
+				func(cfg *Config) {
+					cfg.FailOpen = boolPtr(tt.failOpen)
+					cfg.ConsentAPITimeout = consentTimeoutMs
+					if tt.check {
+						cfg.CheckMode = CheckModeCheck
+					}
+				})
+
+			require.NotEmpty(t, server.recordedCalls(), "the failure must come from a consent call")
+			if tt.wantPass {
+				assert.Equal(t, 0, resp.writtenStatus)
+				return
+			}
+			assert.Equal(t, DefaultDenyStatusCode, resp.writtenStatus)
+		})
+	}
 }
