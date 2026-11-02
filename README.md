@@ -116,13 +116,15 @@ Configured via the APISIX route plugin JSON (identically on both `ext-plugin-pre
 | `service` | `string` | No | — | Logical dataset id sent to the OwnerResolver as `resource.service`, so it can select the rule for this route. |
 | `response_phase_timeout` | `int` | No | `10000` | Budget in ms for the **entire** response phase — party lookups, `/resolve`, and every per-owner consent check together. APISIX holds the buffered response for this whole time, so it is bounded independently of the per-call timeouts. Range 1–120000. |
 | `require_purpose` | `bool` | No | `false` | Deny when a resolved claim names no processing purpose. Purpose matching depends on the OwnerResolver populating an optional field, so a resolver that never sets it runs with purpose scoping silently disabled; turn this on once yours emits one. `consent_purpose_unconstrained_total` counts the checks it would deny. |
+| `require_contract` | `bool` | No | `false` | Deny when a resolved claim names neither a `contractUri` nor a `privacyNoticeId` and the route sets no `privacy_notice_id`. Without it such a claim matches any consent the owner granted this consumer under this provider, whatever the contract; turn it on once your resolver emits one of the two. |
+| `check_mode` | `string` | No | `list` | How consents are looked up: `list` (`GET /consents?userIdentifier=`, one call per owner) or `check` (`GET /consents/check`, then a read of the consent it names — one extra round trip). Both apply the same match. Any other value fails validation. |
+| `privacy_notice_id` | `string` | No | — | Route-level privacy notice UUID consents are scoped to when a resolved claim names none. Must be a UUID; it is lowercased on load. In `check` mode a claim without any notice id is denied. |
+| `purpose` | `string` | No | — | Processing purpose matched (verbatim) when a resolved claim names none. A claim's own purpose wins. |
 | `max_resolve_body_bytes` | `int` | No | `1048576` | Maximum upstream body forwarded to the OwnerResolver. A larger body is denied rather than copied — the body is held whole, validated and marshalled again, so the peak footprint is ~3× its size per in-flight request on top of APISIX's own buffering. Range 1–104857600. |
 | `max_owners_per_response` | `int` | No | `50` | Maximum distinct data owners checked for one response. A response resolving to more is denied rather than answered after an unbounded number of consent calls. Range 1–1000. |
 | `consumer_claim` | `string` | No | `verifiableCredential.issuer` | Dotted claim path naming the **consuming participant**. Supports array indexing (`verifiableCredential[0].issuer`), and a bare segment landing on an array traverses its first element — a Verifiable Presentation routinely carries `verifiableCredential` as an array. Used for the contract lookup and to scope the consent match — never for ownership. |
 | `consent_api_prefix` | `string` | No | `/v1` | API prefix prepended to endpoint paths (the consent-manager's `API_PREFIX`). Must start with `/`; a trailing `/` is trimmed. |
-| `consent_api_host` | `string` | No | — | Overrides the HTTP `Host` header on consent-manager calls. Needed when `consent_api_url` points at an in-cluster service whose gateway route is host-scoped to the public ingress name. |
 | `consent_api_timeout` | `int` | No | `5000` | Per-call timeout in ms. Range 1–60000. |
-| `consent_key` | `string` | No | — | Shared secret sent as `x-visionstrust-consent-key` on call 1. **Optional**: behind the authority's facade the key is injected server-side (and overrides anything sent here). Falls back to `CONSENT_KEY`. |
 | `token_service_url` | `string` | Yes* | — | The participant-local OID4VP token service (the consent-facade's `POST /internal/tokens`). Falls back to `CONSENT_TOKEN_SERVICE_URL`. `http`/`https` only. |
 | `token_audience` | `string` | No | `consent-manager` | Audience **name** asked of the token service — its own configured target, not a URL. |
 | `participant_token_ttl` | `int` | No | `3000` | Seconds a fetched token is cached. The token service's own `expires_in` wins when shorter. Range 1–86400. |
@@ -146,12 +148,12 @@ and is rejected rather than loaded.
 
 † Required only when `audit_enabled` is `true`.
 
-**Credentials via env.** `consent_key`, `token_service_url` and
-`audit_otlp_endpoint` each fall back to an environment variable (`CONSENT_KEY`,
-`CONSENT_TOKEN_SERVICE_URL`, `CONSENT_AUDIT_OTLP_ENDPOINT`) when omitted from the
-route config; a value in the config always wins. The plugin runner inherits these
-from the APISIX container, which sources them from a Kubernetes Secret — so
-secrets need not be stored as plaintext in the route config (etcd).
+**Credentials via env.** `token_service_url` and `audit_otlp_endpoint` each
+fall back to an environment variable (`CONSENT_TOKEN_SERVICE_URL`,
+`CONSENT_AUDIT_OTLP_ENDPOINT`) when omitted from the route config; a value in
+the config always wins. The plugin runner inherits these from the APISIX
+container, which sources them from a Kubernetes Secret — so secrets need not be
+stored as plaintext in the route config (etcd).
 
 **Metrics.** Set the `CONSENT_METRICS_ADDRESS` environment variable on the
 plugin runner (e.g. `:9091`) to expose Prometheus metrics on `/metrics`:

@@ -19,6 +19,7 @@ package plugin
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -61,6 +62,8 @@ func TestParseConfig(t *testing.T) {
 				assert.Equal(t, DefaultDenyResponseBody, cfg.DenyResponseBody)
 				assert.Equal(t, DefaultDenyResponseContentType, cfg.DenyResponseContentType)
 				assert.Nil(t, cfg.JWTClaimsToForward)
+				assert.Equal(t, CheckModeList, cfg.CheckMode)
+				assert.False(t, cfg.RequireContract)
 			},
 		},
 		{
@@ -244,29 +247,122 @@ func TestParseConfig(t *testing.T) {
 // config always takes precedence over the env var.
 func TestParseConfig_EnvFallback(t *testing.T) {
 	t.Run("env fills empty fields", func(t *testing.T) {
-		t.Setenv(EnvConsentKey, "ck-from-env")
 		t.Setenv(EnvTokenServiceURL, "http://facade-from-env:8080/internal/tokens")
 
 		in := validConfigJSON()
 		delete(in, "token_service_url") // so the env var is the only source
 		cfg, err := ParseConfig(toJSON(t, in))
 		require.NoError(t, err)
-		assert.Equal(t, "ck-from-env", cfg.ConsentKey)
 		assert.Equal(t, "http://facade-from-env:8080/internal/tokens", cfg.TokenServiceURL)
 	})
 
 	t.Run("config values win over env", func(t *testing.T) {
-		t.Setenv(EnvConsentKey, "ck-from-env")
 		t.Setenv(EnvTokenServiceURL, "http://facade-from-env:8080/internal/tokens")
 
 		in := validConfigJSON()
-		in["consent_key"] = "ck-from-config"
 		in["token_service_url"] = "http://facade-from-config:8080/internal/tokens"
 		cfg, err := ParseConfig(toJSON(t, in))
 		require.NoError(t, err)
-		assert.Equal(t, "ck-from-config", cfg.ConsentKey)
 		assert.Equal(t, "http://facade-from-config:8080/internal/tokens", cfg.TokenServiceURL)
 	})
+}
+
+// testPrivacyNoticeID is a well-formed privacy notice UUID for config tests.
+const testPrivacyNoticeID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+
+// TestParseConfig_ConsentLookupOptions covers check_mode, privacy_notice_id,
+// purpose and require_contract.
+func TestParseConfig_ConsentLookupOptions(t *testing.T) {
+	tests := []struct {
+		name      string
+		set       map[string]interface{}
+		errSubstr string
+		check     func(t *testing.T, cfg *Config)
+	}{
+		{
+			name: "check_mode defaults to list",
+			check: func(t *testing.T, cfg *Config) {
+				assert.Equal(t, CheckModeList, cfg.CheckMode)
+			},
+		},
+		{
+			name: "check_mode list is kept",
+			set:  map[string]interface{}{"check_mode": CheckModeList},
+			check: func(t *testing.T, cfg *Config) {
+				assert.Equal(t, CheckModeList, cfg.CheckMode)
+			},
+		},
+		{
+			name: "check_mode check with privacy_notice_id",
+			set:  map[string]interface{}{"check_mode": CheckModeCheck, "privacy_notice_id": testPrivacyNoticeID},
+			check: func(t *testing.T, cfg *Config) {
+				assert.Equal(t, CheckModeCheck, cfg.CheckMode)
+				assert.Equal(t, testPrivacyNoticeID, cfg.PrivacyNoticeID)
+			},
+		},
+		{
+			name: "check_mode check without privacy_notice_id is valid",
+			set:  map[string]interface{}{"check_mode": CheckModeCheck},
+			check: func(t *testing.T, cfg *Config) {
+				assert.Equal(t, CheckModeCheck, cfg.CheckMode)
+				assert.Empty(t, cfg.PrivacyNoticeID)
+			},
+		},
+		{
+			name:      "unknown check_mode is rejected",
+			set:       map[string]interface{}{"check_mode": "receipt"},
+			errSubstr: "check_mode must be",
+		},
+		{
+			name:      "check_mode is case-sensitive",
+			set:       map[string]interface{}{"check_mode": "LIST"},
+			errSubstr: "check_mode must be",
+		},
+		{
+			name: "uppercase privacy_notice_id is lowercased",
+			set:  map[string]interface{}{"privacy_notice_id": strings.ToUpper(testPrivacyNoticeID)},
+			check: func(t *testing.T, cfg *Config) {
+				assert.Equal(t, testPrivacyNoticeID, cfg.PrivacyNoticeID)
+			},
+		},
+		{
+			name: "removed Visions options still load",
+			set:  map[string]interface{}{"consent_api_host": "consent.example", "consent_key": "k"},
+			check: func(t *testing.T, cfg *Config) {
+				assert.Equal(t, CheckModeList, cfg.CheckMode)
+			},
+		},
+		{
+			name:      "malformed privacy_notice_id is rejected",
+			set:       map[string]interface{}{"privacy_notice_id": "notice-1"},
+			errSubstr: "privacy_notice_id must be a UUID",
+		},
+		{
+			name: "purpose and require_contract are kept",
+			set:  map[string]interface{}{"purpose": "Service improvement", "require_contract": true},
+			check: func(t *testing.T, cfg *Config) {
+				assert.Equal(t, "Service improvement", cfg.Purpose)
+				assert.True(t, cfg.RequireContract)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			in := validConfigJSON()
+			for k, v := range tt.set {
+				in[k] = v
+			}
+			cfg, err := ParseConfig(toJSON(t, in))
+			if tt.errSubstr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.errSubstr)
+				return
+			}
+			require.NoError(t, err)
+			tt.check(t, cfg)
+		})
+	}
 }
 
 // TestParseConfig_TokenAudienceDefault verifies the audience defaults to the
@@ -356,6 +452,7 @@ func TestConfig_Validate(t *testing.T) {
 		{
 			name: "valid config passes validation",
 			config: Config{
+				CheckMode:               DefaultCheckMode,
 				ConsentAPIURL:           "https://consent.example.com",
 				ConsentAPITimeout:       DefaultConsentAPITimeout,
 				OwnerResolverURL:        "https://owner-resolver.example.com/resolve",

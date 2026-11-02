@@ -41,7 +41,7 @@ const (
 	DefaultAPIPrefix = "/v1"
 
 	// identifierSearchPath resolves a subject to the provider-scoped user
-	// identifier. Authenticated with the consent key.
+	// identifier. Carries the participant token only.
 	identifierSearchPath = "/users/identifier/search"
 
 	// participantConsentsPathFmt lists a user identifier's consents as seen by
@@ -55,9 +55,6 @@ const (
 	// participant registry), used to map a participant DID to its
 	// self-description URL.
 	participantsPath = "/participants"
-
-	// consentKeyHeader carries the shared consent key on the identifier search.
-	consentKeyHeader = "x-visionstrust-consent-key"
 
 	// grantedStatus is the consent status that authorizes access.
 	grantedStatus = "granted"
@@ -102,13 +99,8 @@ var ErrParticipantNotRegistered = errors.New("consent client: participant not re
 type ClientConfig struct {
 	// BaseURL is the consent-manager root (e.g. "http://consent-manager:3000").
 	BaseURL string
-	// Host, if set, overrides the HTTP Host header on every request (the URL host
-	// is still used for the connection). Needed for host-scoped gateway routes.
-	Host string
 	// APIPrefix is prepended to endpoint paths (defaults to DefaultAPIPrefix).
 	APIPrefix string
-	// ConsentKey is the shared secret sent on the identifier search (required).
-	ConsentKey string
 	// ProviderSD, if empty, is derived from GET /participants/me after login.
 	ProviderSD string
 	// ParticipantToken, if set, is used as a static token (nothing is fetched).
@@ -130,8 +122,8 @@ type ClientConfig struct {
 // no single "is there consent?" endpoint, so a check is a two-call chain:
 //
 //  1. POST {base}/users/identifier/search  — resolve the subject (a DID carried
-//     as the user "email") to the provider-scoped user identifier, authenticated
-//     with the shared consent key and scoped by the provider self-description.
+//     as the user "email") to the provider-scoped user identifier, scoped by the
+//     provider self-description.
 //  2. GET  {base}/consents/participants/{id}?receipt=true — list that user's
 //     consents, authenticated with the participant JWT.
 //
@@ -146,9 +138,7 @@ type ClientConfig struct {
 // (see hasGrantedConsent).
 type Client struct {
 	baseURL         string
-	host            string
 	apiPrefix       string
-	consentKey      string
 	providerSD      string
 	staticToken     string
 	tokenServiceURL string
@@ -174,9 +164,7 @@ func NewClient(cfg ClientConfig) *Client {
 	}
 	return &Client{
 		baseURL:         cfg.BaseURL,
-		host:            cfg.Host,
 		apiPrefix:       prefix,
-		consentKey:      cfg.ConsentKey,
 		providerSD:      cfg.ProviderSD,
 		staticToken:     cfg.ParticipantToken,
 		tokenServiceURL: cfg.TokenServiceURL,
@@ -224,13 +212,11 @@ const credentialKeySeparator = "\x00"
 func (c *Client) cacheKey() string {
 	return strings.Join([]string{
 		c.baseURL,
-		c.host,
 		c.apiPrefix,
 		c.tokenAudience,
 		c.tokenServiceURL,
 		c.providerSD,
 		hashSecret(c.staticToken),
-		hashSecret(c.consentKey),
 	}, credentialKeySeparator)
 }
 
@@ -684,10 +670,9 @@ type identifierSearchResponse struct {
 // the same owner under several data resources searches once instead of once per
 // resource.
 //
-// It carries both the shared consent key (which the consent-manager's
-// consentKeyCheck validates) and the participant token as a Bearer credential,
-// so an authenticating facade in front of the consent-manager can validate the
-// participant JWT on this call too (the consent-manager ignores the Bearer here).
+// It carries the participant token as a Bearer credential, so an authenticating
+// facade in front of the consent-manager can validate the participant JWT on
+// this call too.
 func (c *Client) resolveUserIdentifier(ctx context.Context, subject, providerSD, token string) (identifier string, found bool, err error) {
 	cacheKey := c.identifierCacheKey(providerSD, subject)
 	identifierMu.Lock()
@@ -706,13 +691,6 @@ func (c *Client) resolveUserIdentifier(ctx context.Context, subject, providerSD,
 		return "", false, fmt.Errorf("consent client: failed to create identifier search request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", ContentTypeJSON)
-	// The consent key is optional here: when the plugin sits behind the
-	// authority's facade, the facade injects x-visionstrust-consent-key from
-	// its own secret and overrides anything we send. We only set it for a
-	// direct (facade-less) deployment where the plugin holds the key itself.
-	if c.consentKey != "" {
-		httpReq.Header.Set(consentKeyHeader, c.consentKey)
-	}
 	if token != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+token)
 	}
@@ -922,9 +900,6 @@ func (c *Client) endpoint(path string) string {
 // not surface the *http.Response: the body is already consumed and closed, so
 // callers only need the status code and body bytes.
 func (c *Client) do(httpReq *http.Request) (statusCode int, body []byte, err error) {
-	if c.host != "" {
-		httpReq.Host = c.host
-	}
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
 		return 0, nil, fmt.Errorf("consent client: HTTP request failed: %w", err)
