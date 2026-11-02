@@ -290,6 +290,7 @@ type dscConsentManager struct {
 	mu         sync.Mutex
 	consents   []*dscConsent
 	asked      []string
+	notices    []string
 	failStatus int
 }
 
@@ -383,12 +384,20 @@ func (m *dscConsentManager) askedSubjects() []string {
 	return slices.Clone(m.asked)
 }
 
-// begin records subject and reports false once it has written the configured failure.
-func (m *dscConsentManager) begin(w http.ResponseWriter, subject string) bool {
+// askedNotices returns the privacyNoticeId query value of each askedSubjects entry.
+func (m *dscConsentManager) askedNotices() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return slices.Clone(m.notices)
+}
+
+// begin records subject and notice and reports false once it has written the configured failure.
+func (m *dscConsentManager) begin(w http.ResponseWriter, subject, notice string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if subject != "" {
 		m.asked = append(m.asked, subject)
+		m.notices = append(m.notices, notice)
 	}
 	if m.failStatus != 0 {
 		w.WriteHeader(m.failStatus)
@@ -421,15 +430,14 @@ func (m *dscConsentManager) serveToken(w http.ResponseWriter, r *http.Request) {
 // subject, filtered by status (default GRANTED) and, when given, the notice.
 func (m *dscConsentManager) serveList(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	subject := q.Get("userIdentifier")
-	if !m.begin(w, subject) {
+	subject, notice := q.Get("userIdentifier"), q.Get("privacyNoticeId")
+	if !m.begin(w, subject, notice) {
 		return
 	}
 	status := q.Get("status")
 	if status == "" {
 		status = consentStatusOK
 	}
-	notice := q.Get("privacyNoticeId")
 
 	m.mu.Lock()
 	records := []map[string]interface{}{}
@@ -448,11 +456,10 @@ func (m *dscConsentManager) serveList(w http.ResponseWriter, r *http.Request) {
 // nothing about the consumer, so a valid answer alone must not release data.
 func (m *dscConsentManager) serveCheck(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	subject := q.Get("userIdentifier")
-	if !m.begin(w, subject) {
+	subject, notice, purpose := q.Get("userIdentifier"), q.Get("privacyNoticeId"), q.Get("purpose")
+	if !m.begin(w, subject, notice) {
 		return
 	}
-	notice, purpose := q.Get("privacyNoticeId"), q.Get("purpose")
 	if notice == "" {
 		w.WriteHeader(http.StatusBadRequest)
 		return
@@ -473,7 +480,7 @@ func (m *dscConsentManager) serveCheck(w http.ResponseWriter, r *http.Request) {
 
 // serveRead answers GET /consents/{id}, with 404 when the caller is no party.
 func (m *dscConsentManager) serveRead(w http.ResponseWriter, r *http.Request) {
-	if !m.begin(w, "") {
+	if !m.begin(w, "", "") {
 		return
 	}
 	assert.Equal(m.t, "full", r.URL.Query().Get("format"), "the consent read must ask for the full record")
@@ -540,8 +547,15 @@ func newRecordingOwnerResolver(t *testing.T, reply map[string]interface{}, recei
 // owners for every payload.
 func newOwnerResolver(t *testing.T, owners ...string) *httptest.Server {
 	t.Helper()
+	return newStaticOwnerResolver(t, resolveReply(owners...))
+}
+
+// newStaticOwnerResolver starts a mock OwnerResolver that answers every
+// payload with reply and discards the envelopes.
+func newStaticOwnerResolver(t *testing.T, reply map[string]interface{}) *httptest.Server {
+	t.Helper()
 	var received []resolveEnvelope
-	return newRecordingOwnerResolver(t, resolveReply(owners...), &received)
+	return newRecordingOwnerResolver(t, reply, &received)
 }
 
 // resolveReply builds a /resolve reply requiring consent from the given owners.
@@ -771,48 +785,79 @@ func TestIntegration_ConsentScoping(t *testing.T) {
 // route-level notice id and require_contract on.
 func TestIntegration_ClaimContractScoping(t *testing.T) {
 	const owner = "did:key:zAlice"
-	claimModes := []string{plugin.CheckModeList, plugin.CheckModeCheck}
+	bothModes := []string{plugin.CheckModeList, plugin.CheckModeCheck}
+	listOnly := []string{plugin.CheckModeList}
 
 	tests := []struct {
 		name       string
+		modes      []string
 		grant      []consentOption
 		claim      map[string]string
 		wantDenied bool
+		// wantNotices is the privacyNoticeId of each consent call; nil means none is made.
+		wantNotices []string
 	}{
 		{
-			name:  "consent under the claim notice allows",
-			claim: map[string]string{"privacyNoticeId": itestNoticeID},
+			name:        "consent under the claim notice allows",
+			modes:       bothModes,
+			claim:       map[string]string{"privacyNoticeId": itestNoticeID},
+			wantNotices: []string{itestNoticeID},
 		},
 		{
-			name:       "consent under another notice denies",
-			grant:      []consentOption{underNotice(itestOtherNoticeID)},
-			claim:      map[string]string{"privacyNoticeId": itestNoticeID},
-			wantDenied: true,
+			name:        "consent under another notice denies",
+			modes:       bothModes,
+			grant:       []consentOption{underNotice(itestOtherNoticeID)},
+			claim:       map[string]string{"privacyNoticeId": itestNoticeID},
+			wantDenied:  true,
+			wantNotices: []string{itestNoticeID},
 		},
 		{
-			name:  "consent under the claim contract allows",
-			claim: map[string]string{"privacyNoticeId": itestNoticeID, "contractUri": itestContractURI},
+			name:        "consent under the claim contract and notice allows",
+			modes:       bothModes,
+			claim:       map[string]string{"privacyNoticeId": itestNoticeID, "contractUri": itestContractURI},
+			wantNotices: []string{itestNoticeID},
 		},
 		{
-			name:       "consent under another contract denies",
-			grant:      []consentOption{underContract(itestOtherContractURI)},
-			claim:      map[string]string{"privacyNoticeId": itestNoticeID, "contractUri": itestContractURI},
+			name:        "consent under another contract with the claim notice denies",
+			modes:       bothModes,
+			grant:       []consentOption{underContract(itestOtherContractURI)},
+			claim:       map[string]string{"privacyNoticeId": itestNoticeID, "contractUri": itestContractURI},
+			wantDenied:  true,
+			wantNotices: []string{itestNoticeID},
+		},
+		{
+			name:        "contract alone scopes the list and allows",
+			modes:       listOnly,
+			claim:       map[string]string{"contractUri": itestContractURI},
+			wantNotices: []string{""},
+		},
+		{
+			name:        "contract alone denies a consent under another contract",
+			modes:       listOnly,
+			grant:       []consentOption{underContract(itestOtherContractURI)},
+			claim:       map[string]string{"contractUri": itestContractURI},
+			wantDenied:  true,
+			wantNotices: []string{""},
+		},
+		{
+			name:       "contract alone denies in check mode without asking",
+			modes:      []string{plugin.CheckModeCheck},
+			claim:      map[string]string{"contractUri": itestContractURI},
 			wantDenied: true,
 		},
 	}
 
-	for _, mode := range claimModes {
-		for _, tt := range tests {
+	for _, tt := range tests {
+		for _, mode := range tt.modes {
 			t.Run(mode+"/"+tt.name, func(t *testing.T) {
 				consent.ResetCaches()
 				cm := newDSCConsentManager(t)
 				cm.grant(owner, tt.grant...)
 				claim := maps.Clone(tt.claim)
 				claim["ownerId"] = owner
-				var received []resolveEnvelope
-				resolver := newRecordingOwnerResolver(t, map[string]interface{}{
+				resolver := newStaticOwnerResolver(t, map[string]interface{}{
 					"consentRequired": true, "claims": []map[string]string{claim},
-				}, &received)
+				})
 
 				cfg := baseConfig(cm.URL, resolver.URL, map[string]interface{}{"check_mode": mode, "require_contract": true})
 				resp := runPluginCycle(t, marshalConfig(t, cfg),
@@ -823,7 +868,7 @@ func TestIntegration_ClaimContractScoping(t *testing.T) {
 				} else {
 					assertAllowed(t, resp)
 				}
-				assert.Equal(t, []string{owner}, cm.askedSubjects(), "the claim scoping must reach the consent-manager")
+				assert.Equal(t, tt.wantNotices, cm.askedNotices(), "the claim notice id must reach the consent-manager")
 			})
 		}
 	}
@@ -1060,8 +1105,7 @@ func TestIntegration_Resolver(t *testing.T) {
 					}))
 					t.Cleanup(resolver.Close)
 				} else {
-					var received []resolveEnvelope
-					resolver = newRecordingOwnerResolver(t, tt.resolverReply, &received)
+					resolver = newStaticOwnerResolver(t, tt.resolverReply)
 				}
 
 				cfg := baseConfig(cm.URL, resolver.URL, mode.config, map[string]interface{}{"fail_open": tt.failOpen})
