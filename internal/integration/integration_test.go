@@ -197,6 +197,12 @@ const (
 	itestOtherProviderDID = "did:key:zOtherProvider"
 	// itestNoticeID is the privacy notice every granted consent is given under.
 	itestNoticeID = "3f2a6c1e-0b7d-4c8e-9a51-2d4e6f708192"
+	// itestOtherNoticeID is a privacy notice the resolver never names.
+	itestOtherNoticeID = "9c1d2e3f-4a5b-4c6d-8e7f-0a1b2c3d4e5f"
+	// itestContractURI is the contract every granted consent is given under.
+	itestContractURI = "https://contracts.example/trip-history"
+	// itestOtherContractURI is a contract the resolver never names.
+	itestOtherContractURI = "https://contracts.example/marketing"
 	// itestCaller is the token's sub, which must never be taken as the data owner.
 	itestCaller = "did:key:zCaller"
 	// itestPurpose is the route-level purpose a consent must list to be matched.
@@ -228,8 +234,8 @@ var itestRegistry = map[string]string{
 
 // dscConsent is one consent held by the fake.
 type dscConsent struct {
-	id, subject, noticeID, provider, consumer, status string
-	purposes                                          []string
+	id, subject, noticeID, contractURI, provider, consumer, status string
+	purposes                                                       []string
 }
 
 // visible reports whether the caller (always this participant) is a party to c,
@@ -243,6 +249,7 @@ func (c *dscConsent) record() map[string]interface{} {
 	return map[string]interface{}{
 		"id":              c.id,
 		"privacyNoticeId": c.noticeID,
+		"contractUri":     c.contractURI,
 		"status":          c.status,
 		"consented":       c.status == consentStatusOK,
 		"provider":        c.provider,
@@ -260,6 +267,12 @@ func toConsumer(did string) consentOption { return func(c *dscConsent) { c.consu
 
 // fromProvider names did as the consent's provider.
 func fromProvider(did string) consentOption { return func(c *dscConsent) { c.provider = did } }
+
+// underNotice sets the privacy notice the consent was given under.
+func underNotice(id string) consentOption { return func(c *dscConsent) { c.noticeID = id } }
+
+// underContract sets the contract the consent was given under.
+func underContract(uri string) consentOption { return func(c *dscConsent) { c.contractURI = uri } }
 
 // withPurposes sets the purposes the consent was given for.
 func withPurposes(purposes ...string) consentOption {
@@ -321,18 +334,20 @@ func (m *dscConsentManager) checkProtocol(next http.Handler) http.Handler {
 	})
 }
 
-// grant stores a GRANTED consent of subject under itestNoticeID, from this
+// grant stores a GRANTED consent of subject under itestNoticeID and
+// itestContractURI, from this
 // participant to itestConsumerDID unless opts say otherwise, and returns its id.
 func (m *dscConsentManager) grant(subject string, opts ...consentOption) string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	c := &dscConsent{
-		id:       fmt.Sprintf(consentIDFmt, len(m.consents)+1),
-		subject:  subject,
-		noticeID: itestNoticeID,
-		provider: itestProviderDID,
-		consumer: itestConsumerDID,
-		status:   consentStatusOK,
+		id:          fmt.Sprintf(consentIDFmt, len(m.consents)+1),
+		subject:     subject,
+		noticeID:    itestNoticeID,
+		contractURI: itestContractURI,
+		provider:    itestProviderDID,
+		consumer:    itestConsumerDID,
+		status:      consentStatusOK,
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -746,6 +761,69 @@ func TestIntegration_ConsentScoping(t *testing.T) {
 				} else {
 					assertAllowed(t, resp)
 				}
+			})
+		}
+	}
+}
+
+// TestIntegration_ClaimContractScoping verifies the per-claim contractUri and
+// privacyNoticeId from the resolver scope the match in each mode, with no
+// route-level notice id and require_contract on.
+func TestIntegration_ClaimContractScoping(t *testing.T) {
+	const owner = "did:key:zAlice"
+	claimModes := []string{plugin.CheckModeList, plugin.CheckModeCheck}
+
+	tests := []struct {
+		name       string
+		grant      []consentOption
+		claim      map[string]string
+		wantDenied bool
+	}{
+		{
+			name:  "consent under the claim notice allows",
+			claim: map[string]string{"privacyNoticeId": itestNoticeID},
+		},
+		{
+			name:       "consent under another notice denies",
+			grant:      []consentOption{underNotice(itestOtherNoticeID)},
+			claim:      map[string]string{"privacyNoticeId": itestNoticeID},
+			wantDenied: true,
+		},
+		{
+			name:  "consent under the claim contract allows",
+			claim: map[string]string{"privacyNoticeId": itestNoticeID, "contractUri": itestContractURI},
+		},
+		{
+			name:       "consent under another contract denies",
+			grant:      []consentOption{underContract(itestOtherContractURI)},
+			claim:      map[string]string{"privacyNoticeId": itestNoticeID, "contractUri": itestContractURI},
+			wantDenied: true,
+		},
+	}
+
+	for _, mode := range claimModes {
+		for _, tt := range tests {
+			t.Run(mode+"/"+tt.name, func(t *testing.T) {
+				consent.ResetCaches()
+				cm := newDSCConsentManager(t)
+				cm.grant(owner, tt.grant...)
+				claim := maps.Clone(tt.claim)
+				claim["ownerId"] = owner
+				var received []resolveEnvelope
+				resolver := newRecordingOwnerResolver(t, map[string]interface{}{
+					"consentRequired": true, "claims": []map[string]string{claim},
+				}, &received)
+
+				cfg := baseConfig(cm.URL, resolver.URL, map[string]interface{}{"check_mode": mode, "require_contract": true})
+				resp := runPluginCycle(t, marshalConfig(t, cfg),
+					consentRequestFrom(itestConsumerDID), []byte(`{"email":"alice@example.org"}`))
+
+				if tt.wantDenied {
+					assertDenied(t, resp)
+				} else {
+					assertAllowed(t, resp)
+				}
+				assert.Equal(t, []string{owner}, cm.askedSubjects(), "the claim scoping must reach the consent-manager")
 			})
 		}
 	}
